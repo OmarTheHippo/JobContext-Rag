@@ -1,0 +1,12 @@
+# Existing application has no external Python dependencies.
+# Install these from the directory containing jobcontext.txt:
+#
+#   py -m pip install -r requirements-rag.txt
+#
+# Chroma downloads its default local embedding model on first use.
+# That model is used locally to build/search vector indexes.
+
+chromadb>=0.5.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
