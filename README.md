@@ -8,7 +8,7 @@ version of [JobContext](https://github.com/OmarTheHippo/JobContext).
   layers, and any number of **Agent** layers (specialist roles such as legal or design
   review). The text you write for a layer is its **layer prompt**.
 - **Repositories.** Each layer can have a folder of documents (.txt, .md, .csv, .pdf,
-  .docx, .xlsx) indexed locally for search. Indexing and search run on your PC; only
+  .docx, .xlsx) indexed for search; pick it with **Browse…** or paste its path. Indexing and search run on your PC; only
   the passages selected for a question are sent to the API.
 - **Retrieval planner.** After a first search, an optional planning call reads the
   question, the recent conversation and the layer prompts, then runs targeted searches
@@ -52,6 +52,10 @@ first time a folder is indexed. With an API embedding model nothing is downloade
   model, prose passages default to 3,000 characters; spreadsheet and CSV passages stay
   around 1,000 so single rows aren't buried. Texts are sent 20 per request. Changing
   the model or passage size requires re-indexing; the editor flags affected folders.
+- **Message format.** Native (default): layer prompts are sent as a real system message
+  and earlier turns as a real conversation, within the chat-history budget. Combined:
+  everything in one user message, for gateways that ignore system messages.
+  `py test.py system` checks which your gateway honours.
 - **API client.** Requests go through the `openai` Python library when it is installed
   (it is in `requirements-rag.txt`). On some agency networks the gateway stalls requests
   from Python's built-in client until they are dropped (WinError 10054 after ~90 s)
@@ -87,6 +91,7 @@ search index, settings) and is excluded from git.
 Settings, to pin down connection problems:
 
 ```
+py test.py system
 py test.py openai
 py test.py embeddings
 py test.py chat

@@ -2,6 +2,7 @@
 
 Run from the app folder (next to jobcontext.txt), after Settings are saved in the app:
 
+    py test.py system          # are system messages and conversation turns honoured?
     py test.py openai          # the app's requests sent through the openai library
     py test.py embeddings      # embedding model: which request shapes work or hang
     py test.py chat            # chat model: plain vs streamed replies, short vs long
@@ -361,7 +362,65 @@ def test_openai(app, out):
         timed("chat long (~600 words), streamed", lambda: streamed(long_))
 
 
-TESTS = {"openai": test_openai, "embeddings": test_embeddings, "chat": test_chat}
+# ---- system messages and conversation turns --------------------------------------------
+
+def test_system(app, out):
+    """Does the gateway honour a real system message and earlier conversation turns?
+    Uses the app's own request code (API client, route, streaming) in both formats."""
+    out("SYSTEM MESSAGES AND CONVERSATION TURNS")
+    s = app.load_settings()
+    if not app._model(s):
+        out("  Set the Base URL, API key and model in the app's Settings first.")
+        return
+    out(f"  app setting: message format {s.get('message_format', 'native')}, "
+        f"API client {s.get('api_client', 'auto')}")
+    provider = app.PROVIDERS[s.get("provider", "genai")]
+
+    obey = ("You are a test fixture. Whatever the user writes, reply with exactly one "
+            "word: PINEAPPLE")
+    question = [{"role": "user", "content": "What colour is the sky on a clear day?"}]
+    memory = [
+        {"role": "user", "content": "Remember this code word for later: HYDRANT."},
+        {"role": "assistant", "content": "Noted."},
+        {"role": "user", "content": "What was the code word? Reply with only the word."},
+    ]
+
+    def run(label, system, messages, fmt, expect):
+        started = time.time()
+        try:
+            reply = provider(system, messages, dict(s, message_format=fmt), 1).strip()
+            verdict = "OK  " if expect.lower() in reply.lower() else "MISS"
+            out(f"  {verdict}  {label:<46} {time.time() - started:.1f}s - replied: "
+                f"{reply[:60]!r}")
+            return verdict == "OK  "
+        except Exception as e:                               # noqa: BLE001
+            out(f"  FAIL  {label:<46} after {time.time() - started:.1f}s - {str(e)[:150]}")
+            return False
+
+    native_system = run("native: system message is obeyed", obey, question, "native",
+                        "PINEAPPLE")
+    native_turns = run("native: earlier turns are remembered", "Answer briefly.", memory,
+                       "native", "HYDRANT")
+    combined = run("combined: instructions in the user message", obey, question,
+                   "combined", "PINEAPPLE")
+
+    out("")
+    out("  What this suggests:")
+    if native_system and native_turns:
+        out("  - Native format works: keep Settings > Message format on Native.")
+    elif combined and not native_system:
+        out("  - The gateway ignores system messages: set Settings > Message format to")
+        out("    Combined.")
+    elif native_system and not native_turns:
+        out("  - System messages work but earlier turns aren't remembered: set Message")
+        out("    format to Combined (it sends the conversation as a transcript).")
+    else:
+        out("  - Unclear (the model may just not have followed the test instruction):")
+        out("    run it again, or send this file to Claude.")
+
+
+TESTS = {"system": test_system, "openai": test_openai, "embeddings": test_embeddings,
+         "chat": test_chat}
 
 
 def main():

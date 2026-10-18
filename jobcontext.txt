@@ -50,7 +50,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.5.0"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -210,6 +210,8 @@ DEFAULT_SETTINGS = {
     "proxy_mode": "env",
     # Which HTTP client sends API requests; see _use_openai().
     "api_client": "auto",
+    # How instructions and history are sent; see _wire_messages().
+    "message_format": "native",
 }
 
 # Automatic shares of the context window, used when the overrides are 0.
@@ -486,6 +488,24 @@ def _retry_wait(attempt: int, retry_after: str | None = None) -> float:
     return 2 ** attempt + random.uniform(0, 1)
 
 
+# ----- Message format -------------------------------------------------------------------
+# "native" (default): the standing instructions go in a real system message, and the
+#   caller's messages (which may include earlier conversation turns) follow as-is.
+# "combined": for gateways that ignore system messages - the instructions are put at
+#   the top of the last user message inside <standing_instructions> tags.
+MESSAGE_FORMATS = {
+    "native": "Native: system message + conversation turns (recommended)",
+    "combined": "Combined: everything in one user message (older gateways)",
+}
+
+
+def _wire_messages(system: str, messages: list, s: dict) -> list:
+    if s.get("message_format", "native") == "combined":
+        return messages[:-1] + [{"role": "user", "content": "<standing_instructions>\n" + system
+                                 + "\n</standing_instructions>\n\n" + messages[-1]["content"]}]
+    return [{"role": "system", "content": system}] + list(messages)
+
+
 # ----- OpenAI library client ----------------------------------------------------------
 # On some agency networks the gateway (or something in front of it) stalls requests
 # made with Python's built-in urllib until they are dropped (WinError 10054 after
@@ -588,8 +608,7 @@ def _openai_complete(system: str, messages: list, s: dict, attempts: int | None 
     model = _model(s)
     if not model:
         raise LLMError("Set the Model in Settings.")
-    msgs = messages[:-1] + [{"role": "user", "content": "<standing_instructions>\n" + system
-                             + "\n</standing_instructions>\n\n" + messages[-1]["content"]}]
+    msgs = _wire_messages(system, messages, s)
     max_tokens = int(s.get("max_tokens") or 4000)
     size = f"request ~{len(json.dumps(msgs)) // 4:,} tokens"
 
@@ -668,7 +687,7 @@ def _genai_complete(system: str, messages: list, s: dict, attempts: int | None =
         raise LLMError("No API key - add it in Settings.")
     body = {                                                       # <-- 1. request body
         "model": _model(s),
-        "messages": messages[:-1] + [{"role": "user", "content": "<standing_instructions>\n" + system + "\n</standing_instructions>\n\n" + messages[-1]["content"]}], 
+        "messages": _wire_messages(system, messages, s),
         "max_tokens": int(s.get("max_tokens") or 4000),
     }
     if os.environ.get("JOBCTX_DEBUG_PROMPTS") == "1":
@@ -1164,7 +1183,7 @@ def build_system_prompt(chat: dict) -> str:
     parts.append(
         "\n# Evidence Rules\n"
         "- Use retrieved repository material as evidence only when it is relevant.\n"
-        "- Use the prior conversation transcript to answer follow-up questions.\n"
+        "- Use the earlier conversation to answer follow-up questions.\n"
         "- Identify uncertainty, missing evidence, and material conflicts between sources.\n"
         "- Do not claim to have reviewed documents that were not supplied as retrieved "
         "reference material for this request.\n"
@@ -1200,6 +1219,30 @@ corrections they made to how the assistant behaves.
 - If the user gave an explicit instruction about what to capture, follow it.
 - Keep it concise; merge duplicates rather than appending near-copies.
 - Output ONLY the complete revised layer in Markdown. No preamble, no explanation."""
+
+def build_chat_messages(chat: dict, current_request: str) -> list:
+    """
+    Messages for an answer. Native format: earlier turns as real user/assistant
+    messages (most recent first kept, within the chat-history budget), then the
+    current request. Combined format: one user message with a transcript.
+    """
+    if load_settings().get("message_format", "native") == "combined":
+        return [{"role": "user", "content": build_conversation_request(chat, current_request)}]
+
+    char_budget = budgets()["history"] * 4
+    turns, used = [], 0
+    for message in reversed(chat.get("messages", [])):
+        role = "assistant" if message.get("role") == "assistant" else "user"
+        content = message.get("content", "")
+        if turns and used + len(content) > char_budget:
+            break
+        turns.append({"role": role, "content": content})
+        used += len(content)
+    turns.reverse()
+    while turns and turns[0]["role"] != "user":       # a conversation starts with the user
+        turns.pop(0)
+    return turns + [{"role": "user", "content": current_request}]
+
 
 def build_conversation_request(chat: dict, current_request: str) -> str:
     """
@@ -1960,6 +2003,8 @@ def get_settings(body, query):
             "stream": s.get("stream", True),
             "proxy_mode": s.get("proxy_mode", "env"),
             "api_client": s.get("api_client", "auto"),
+            "message_format": s.get("message_format", "native"),
+            "message_formats": MESSAGE_FORMATS,
             "api_clients": API_CLIENTS,
             "openai_installed": (openai.__version__ if openai else ""),
             "proxy_modes": PROXY_MODES,
@@ -2006,6 +2051,8 @@ def set_settings(body, query):
         s["proxy_mode"] = body["proxy_mode"]
     if body.get("api_client") in API_CLIENTS:
         s["api_client"] = body["api_client"]
+    if body.get("message_format") in MESSAGE_FORMATS:
+        s["message_format"] = body["message_format"]
     _OPENAI_CLIENTS.clear()            # rebuilt with the new settings on next use
     if body.get("embedding_mode") in ("local", "api"):
         s["embedding_mode"] = body["embedding_mode"]
@@ -2221,6 +2268,44 @@ def clear_repository(kind, item_id, body, query):
     save(kind, layer)
 
     return {"ok": True, "repository": layer["repository"]}
+
+
+def _pick_folder(initial: str) -> str:
+    """
+    Show the standard folder dialog on this PC and return the chosen path ("" if
+    cancelled). The page can't do this itself: browsers never reveal a folder's full
+    path. Runs tkinter in its own thread, which is fine for one short-lived dialog.
+    """
+    result = {}
+
+    def run():
+        try:
+            import tkinter
+            from tkinter import filedialog
+            root = tkinter.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)            # in front of the browser
+            root.update()
+            chosen = filedialog.askdirectory(
+                parent=root, title="Choose the folder to index", mustexist=True,
+                initialdir=initial if initial and os.path.isdir(initial) else None)
+            root.destroy()
+            result["path"] = os.path.normpath(chosen) if chosen else ""
+        except Exception as exc:                         # e.g. Python without tkinter
+            result["error"] = str(exc) or type(exc).__name__
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise HttpError(500, "Couldn't open a folder picker on this PC "
+                             f"({result['error']}). Type or paste the folder path instead.")
+    return result["path"]
+
+
+@route("POST", "/api/pick-folder")
+def pick_folder(body, query):
+    return {"path": _pick_folder(str(body.get("initial") or "").strip())}
 
 
 @route("GET", f"/api/projects/{I}/brief")
@@ -2495,10 +2580,7 @@ def send_message(item_id, body, query):
     # 3. Answer: standing layers as the system prompt; transcript, question and
     #    retrieved passages as one user message (the API keeps no chat history).
     user_message = rag.build_user_message(text, retrieved)
-    reply = complete(
-        build_system_prompt(chat),
-        [{"role": "user", "content": build_conversation_request(chat, user_message)}],
-    )
+    reply = complete(build_system_prompt(chat), build_chat_messages(chat, user_message))
     reply = clean_assistant_response(reply)
 
     retrieval_passes = {
@@ -3088,6 +3170,10 @@ PAGE_HTML = r"""<!doctype html>
     <div class="small muted" id="set-key-status"></div>
     <label class="field">Max reply tokens
       <input id="set-max" type="number" min="256" step="256"></label>
+    <label class="field">Message format
+      <select id="set-format"></select></label>
+    <div class="small muted">Check your gateway honours system messages and conversation
+      turns with <code>py test.py system</code>; if not, use Combined.</div>
     <label class="field">API client
       <select id="set-client"></select></label>
     <div class="small muted" id="set-client-note"></div>
@@ -3348,6 +3434,9 @@ async function openSettings() {
   $("#set-client").innerHTML = Object.entries(s.api_clients || {})
     .map(([value, label]) => `<option value="${value}">${esc(label)}</option>`).join("");
   $("#set-client").value = s.api_client || "auto";
+  $("#set-format").innerHTML = Object.entries(s.message_formats || {})
+    .map(([value, label]) => `<option value="${value}">${esc(label)}</option>`).join("");
+  $("#set-format").value = s.message_format || "native";
   $("#set-client-note").textContent = s.openai_installed
     ? `openai library ${s.openai_installed} is installed.`
     : "The openai library is not installed (py -m pip install openai); the built-in client is used.";
@@ -3378,7 +3467,7 @@ async function saveSettings(extra = {}) {
     embedding_mode: $("#set-embed-mode").value, embedding_model: $("#set-embed-model").value,
     chunk_chars: $("#set-chunk").value,
     stream: $("#set-stream").checked, proxy_mode: $("#set-proxy").value,
-    api_client: $("#set-client").value,
+    api_client: $("#set-client").value, message_format: $("#set-format").value,
     ...extra };
   const key = $("#set-key").value.trim();
   if (key) body.api_key = key;
@@ -4446,12 +4535,13 @@ function renderLibEdit() {
         extracted text only if it fits the configured context budget.
       </p>
 
-      <label>
-        Repository folder
+      <label for="repo-path">Repository folder</label>
+      <div class="row" style="flex-wrap:nowrap">
         <input id="repo-path" value="${esc(path)}"
           placeholder="C:\\Users\\...\\Documents\\ProjectFolder"
-          style="width:100%">
-      </label>
+          style="flex:1; min-width:0">
+        <button id="repo-browse" type="button">Browse…</button>
+      </div>
 
       <div id="repo-status" class="repo-status muted small">
         ${esc(repositoryStatusText(layer))}
@@ -4562,6 +4652,21 @@ function renderLibEdit() {
       toast("Layer deleted");
     } catch (error) {
       toast(error.message);
+    }
+  };
+
+  $("#repo-browse").onclick = async () => {
+    const button = $("#repo-browse");
+    button.disabled = true;
+    $("#repo-detail").textContent = "Choose a folder in the window that opened (it may be behind the browser).";
+    try {
+      const r = await api("/api/pick-folder", { json: { initial: $("#repo-path").value.trim() } });
+      if (r.path) $("#repo-path").value = r.path;
+      $("#repo-detail").textContent = r.path ? "Folder chosen. Click Index folder to index it." : "";
+    } catch (error) {
+      $("#repo-detail").textContent = error.message;
+    } finally {
+      button.disabled = false;
     }
   };
 
