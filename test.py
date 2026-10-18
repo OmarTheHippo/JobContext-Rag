@@ -63,14 +63,22 @@ class Out:
         self.lines.append(text)
 
 
-def probe(url: str, body: dict, headers: dict, stream: bool = False) -> dict:
-    """Send one request (no retries) and time it. Never raises."""
+# Python's urllib (used by the app) routes requests through the proxy set in Windows'
+# internet settings; many other clients (e.g. the openai library) don't.
+DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def probe(url: str, body: dict, headers: dict, stream: bool = False,
+          direct: bool = False) -> dict:
+    """Send one request (no retries) and time it. Never raises.
+    direct=True bypasses any system proxy."""
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, headers=headers)
     started, reply_at, received, first_piece_at = time.time(), None, 0, None
     result = {"request_kb": len(data) / 1024}
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        opener = DIRECT.open if direct else urllib.request.urlopen
+        with opener(req, timeout=TIMEOUT) as r:
             reply_at = time.time() - started
             result["status"] = r.status
             result["content_type"] = r.headers.get("Content-Type", "")
@@ -121,6 +129,41 @@ def test_embeddings(app, out):
 
     plain = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
     compact = dict(plain, **{"Accept-Encoding": "gzip", "Accept": "application/json"})
+
+    # 1. How does the request travel? These run first and are quick to compare.
+    proxies = urllib.request.getproxies()
+    shown = {k: v.split("@")[-1] for k, v in proxies.items()}      # hide any credentials
+    out(f"  system proxy Python sees: {shown or 'none'}")
+    out("  How the request travels (one short text each):")
+    first = {}
+    for label, direct in (("via system proxy (as the app does)", False),
+                          ("direct, bypassing system proxy", True)):
+        r = probe(url, {"model": model, "input": ["test sentence"]}, plain, direct=direct)
+        first[label] = r
+        out(line(label, r))
+    try:
+        import openai                                             # what Cline's test used
+        started = time.time()
+        try:
+            client = openai.OpenAI(base_url=url.rsplit("/embeddings", 1)[0], api_key=key,
+                                   timeout=TIMEOUT, max_retries=0)
+            resp = client.embeddings.create(model=model, input=["test sentence"])
+            out(f"  OK    {'openai library (like the Cline test)':<46} "
+                f"{time.time() - started:.1f}s, {len(resp.data[0].embedding)} dims")
+            first["openai"] = {"ok": True}
+        except Exception as e:                                   # noqa: BLE001
+            out(f"  FAIL  {'openai library (like the Cline test)':<46} after "
+                f"{time.time() - started:.1f}s - {type(e).__name__}: {str(e)[:150]}")
+            first["openai"] = {"ok": False}
+    except ImportError:
+        out("  (openai library not installed - skipped)")
+    via_proxy = first["via system proxy (as the app does)"]["ok"]
+    direct_ok = first["direct, bypassing system proxy"]["ok"]
+    if direct_ok and not via_proxy:
+        out("  -> Direct works but the system proxy route fails: the proxy is the problem.")
+        out("     Tell Claude; the app can be set to bypass it.")
+    out("")
+    out("  Request shapes (via the system proxy, as the app sends them):")
 
     def body(texts, b64):
         b = {"model": model, "input": texts}
