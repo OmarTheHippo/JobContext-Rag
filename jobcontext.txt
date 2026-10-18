@@ -28,6 +28,7 @@ import base64
 import hashlib
 import http.client
 import json
+import math
 import random
 import os
 import re
@@ -47,7 +48,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.1.2"
+APP_VERSION = "3.2.0"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -190,11 +191,17 @@ DEFAULT_SETTINGS = {
     "doc_budget": 0,
     "history_budget": 0,
     "brief_guidance": DEFAULT_BRIEF_GUIDANCE,
-    # Project briefs: simultaneous API requests, and the most file text one card
-    # request carries (longer files are read in parts). Small, sequential requests
-    # are the most reliable through strict gateways and proxies.
-    "brief_parallel": 1,
-    "card_tokens": 12000,
+    # Simultaneous API requests when building briefs and when indexing with an API
+    # embedding model.
+    "parallel_requests": 4,
+    # Most file text one card request carries; 0 = as much as the context window
+    # allows (one request for most files). Longer files are read in parts.
+    "card_tokens": 0,
+    # Document search: "local" (built-in model, no network) or "api" (the embedding
+    # model named below, same base URL and key). Passage size 0 = automatic.
+    "embedding_mode": "local",
+    "embedding_model": "",
+    "chunk_chars": 0,
     # Ask the API to stream replies (see _genai_complete); keeps slow requests alive.
     "stream": True,
 }
@@ -275,7 +282,7 @@ def save_settings(settings: dict) -> None:
 
 
 # Initialize local RAG storage under ./data/rag.
-rag.configure(DATA)
+rag.configure(DATA)          # embedding model and passage size: apply_search_settings()
 
 # ===== 2. API KEY STORAGE ===========================================================
 # The key is never written into this file. It is saved in data/settings.json,
@@ -541,6 +548,108 @@ def _genai_complete(system: str, messages: list, s: dict, attempts: int | None =
         raise LLMError("Unexpected response shape: " + json.dumps(data)[:500])
 
 
+# ----- Embeddings (document search) ----------------------------------------------------
+# Used when Settings > Document search is set to an API embedding model. Assumes the
+# common "embeddings" API shape at <base URL>/embeddings:
+#   {"model": ..., "input": ["text", ...]}  ->  {"data": [{"index": 0, "embedding": [...]}, ...]}
+# The model must be named explicitly (leaving it out can select a different default).
+
+EMBED_BATCH = 20                     # texts per embeddings request (measured API limit)
+LOCAL_CHUNK_CHARS = 800              # passage size with the built-in local model
+API_CHUNK_CHARS = 3000               # default passage size with an API embedding model
+
+
+def _parallel_requests() -> int:
+    return max(1, min(8, int(load_settings().get("parallel_requests") or 4)))
+
+
+def _embeddings_endpoint(s: dict) -> str:
+    base = (s.get("base_url") or "").strip().rstrip("/")
+    if base.endswith(CHAT_PATH):
+        base = base[: -len(CHAT_PATH)]
+    return base + "/embeddings" if base else ""
+
+
+def _genai_embed(texts: list[str], s: dict) -> list[list[float]]:
+    """One embeddings request (up to EMBED_BATCH texts), with the same retries as chat."""
+    url, key, model = _embeddings_endpoint(s), get_api_key(), (s.get("embedding_model") or "").strip()
+    if not url:
+        raise LLMError("Set the Base URL in Settings.")
+    if not model:
+        raise LLMError("Set the embedding model in Settings > Document search.")
+    if not key:
+        raise LLMError("No API key - add it in Settings.")
+    payload = json.dumps({"model": model, "input": texts}).encode()
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    size = f"{len(texts)} texts, ~{len(payload) // 4:,} tokens"
+
+    durations: list[float] = []
+    for attempt in range(1, API_ATTEMPTS + 1):
+        started = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
+                data = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:500]
+            if e.code not in RETRYABLE_HTTP_STATUS or attempt == API_ATTEMPTS:
+                raise LLMError(f"Embeddings API error {e.code}: {detail} ({size})")
+            wait, problem = _retry_wait(attempt, e.headers.get("Retry-After")), f"HTTP {e.code}"
+        except (urllib.error.URLError, ConnectionError, TimeoutError,
+                http.client.HTTPException, ValueError) as e:
+            reason = getattr(e, "reason", None) or e
+            problem = f"{type(reason).__name__}: {reason}"
+            durations.append(time.time() - started)
+            if attempt == API_ATTEMPTS:
+                raise ConnectionFailed(f"Embeddings request failed {attempt} times "
+                                       f"({problem}; {size}).", durations)
+            wait = _retry_wait(attempt)
+        print(f"Embeddings request failed ({problem}; {size}); retry {attempt + 1} of "
+              f"{API_ATTEMPTS} in {wait:.0f}s", flush=True)
+        time.sleep(wait)
+
+    try:
+        items = sorted(data["data"], key=lambda item: item.get("index", 0))
+        vectors = [item["embedding"] for item in items]
+    except (KeyError, TypeError):
+        raise LLMError("Unexpected embeddings response: " + json.dumps(data)[:300])
+    if len(vectors) != len(texts):
+        raise LLMError(f"Embeddings API returned {len(vectors)} vectors for {len(texts)} texts.")
+
+    # Unit length, so distances are comparable with the local model's (the search's
+    # relevance cut-offs are relative, but this keeps their scale familiar).
+    out = []
+    for v in vectors:
+        norm = math.sqrt(sum(x * x for x in v)) or 1.0
+        out.append([x / norm for x in v])
+    return out
+
+
+def api_embed(texts: list[str]) -> list[list[float]]:
+    """Embed any number of texts: batches of EMBED_BATCH, several in parallel."""
+    s = load_settings()
+    batches = [texts[i:i + EMBED_BATCH] for i in range(0, len(texts), EMBED_BATCH)]
+    if len(batches) == 1:
+        return _genai_embed(batches[0], s)
+    with ThreadPoolExecutor(max_workers=min(_parallel_requests(), len(batches))) as pool:
+        results = list(pool.map(lambda batch: _genai_embed(batch, s), batches))
+    return [vector for batch in results for vector in batch]
+
+
+def apply_search_settings(s: dict | None = None) -> None:
+    """Point document search at the embedding model and passage size in Settings."""
+    s = s or load_settings()
+    override = int(s.get("chunk_chars") or 0)
+    if s.get("embedding_mode") == "api":
+        model = (s.get("embedding_model") or "").strip()
+        rag.configure_search(api_embed, f"api:{model or '(not set)'}",
+                             override or API_CHUNK_CHARS)
+    else:
+        rag.configure_search(None, rag.LOCAL_EMBED_ID,
+                             min(override or LOCAL_CHUNK_CHARS, rag.LOCAL_MAX_CHUNK_CHARS))
+
+
 def _mock_complete(system: str, messages: list, s: dict, attempts: int | None = None) -> str:
     last = messages[-1]["content"] if messages else ""
     if "<current_layer>" in last:
@@ -552,6 +661,8 @@ def _mock_complete(system: str, messages: list, s: dict, attempts: int | None = 
 
 
 PROVIDERS = {"mock": _mock_complete, "genai": _genai_complete}
+
+apply_search_settings()      # embedding model + passage size from Settings
 
 # ===== 4. STORAGE ===================================================================
 # data/contexts/*.json, data/agents/*.json, data/chats/*.json - plain, readable JSON.
@@ -1291,10 +1402,10 @@ def make_file_card(source: dict, guidance: str) -> dict:
     part whose request keeps failing is narrowed down (see _cards_for_piece). Part
     cards are merged locally (lists combined, first part's type/title kept).
     """
-    # Never more than the context window allows, and never more than the Settings cap.
+    # As much as the context window allows, unless Settings sets a lower cap.
     limits = budgets()
     fits = int((limits["context_window"] - limits["reply"] - 6_000) * 4 * 0.85)
-    wanted = int(load_settings().get("card_tokens") or 12000) * 4
+    wanted = int(load_settings().get("card_tokens") or 0) * 4 or fits
     part_chars = max(8_000, min(fits, wanted))
     text = source["text"]
     starts = list(range(0, len(text), part_chars)) or [0]
@@ -1376,7 +1487,7 @@ def _brief_worker(layer_id: str) -> None:
             with BRIEF_LOCK:
                 BRIEF_JOBS[layer_id]["done"] = BRIEF_JOBS[layer_id].get("done", 0) + 1
 
-        parallel = max(1, min(8, int(load_settings().get("brief_parallel") or 1)))
+        parallel = _parallel_requests()
         with ThreadPoolExecutor(max_workers=parallel) as pool:
             list(pool.map(run, todo))
 
@@ -1525,10 +1636,15 @@ def get_settings(body, query):
             "doc_budget": s.get("doc_budget") or 0,
             "history_budget": s.get("history_budget") or 0,
             "brief_guidance": s.get("brief_guidance", DEFAULT_BRIEF_GUIDANCE),
-            "brief_parallel": s.get("brief_parallel") or 1,
+            "parallel_requests": s.get("parallel_requests") or 4,
+            "embedding_mode": s.get("embedding_mode", "local"),
+            "embedding_model": s.get("embedding_model", ""),
+            "embeddings_endpoint": _embeddings_endpoint(s),
+            "chunk_chars": s.get("chunk_chars") or 0,
+            "chunk_chars_effective": rag.CHUNK_CHARS,
             "stream": s.get("stream", True),
             "stream_rejected": _STREAM_REJECTED[0],
-            "card_tokens": s.get("card_tokens") or 12000,
+            "card_tokens": s.get("card_tokens") or 0,
             "default_brief_guidance": DEFAULT_BRIEF_GUIDANCE,
             "budgets": budgets(s)}
 
@@ -1547,8 +1663,9 @@ def set_settings(body, query):
         ("context_window", "Context window", 8000, False),
         ("doc_budget", "Document passages budget", 1000, True),
         ("history_budget", "Chat history budget", 1000, True),
-        ("brief_parallel", "Brief: simultaneous requests", 1, False),
-        ("card_tokens", "Brief: file text per request", 2000, False),
+        ("parallel_requests", "Simultaneous API requests", 1, False),
+        ("card_tokens", "File text per card request", 2000, True),
+        ("chunk_chars", "Passage size", 300, True),
     ):
         if field not in body:
             continue
@@ -1564,11 +1681,17 @@ def set_settings(body, query):
         s["brief_guidance"] = str(body["brief_guidance"]).strip()
     if "stream" in body:
         s["stream"] = bool(body["stream"])
+    if body.get("embedding_mode") in ("local", "api"):
+        s["embedding_mode"] = body["embedding_mode"]
+    if "embedding_model" in body:
+        s["embedding_model"] = str(body["embedding_model"]).strip()
     if body.get("clear_key"):
         s["api_key_enc"] = ""
     elif body.get("api_key"):                     # blank means "keep the saved key"
         s["api_key_enc"] = encrypt_key(body["api_key"].strip())
+    s["parallel_requests"] = max(1, min(8, int(s.get("parallel_requests") or 4)))
     save_settings(s)
+    apply_search_settings(s)
     return get_settings({}, {})
 
 
@@ -1576,7 +1699,12 @@ def set_settings(body, query):
 def test_settings(body, query):
     t = time.time()
     reply = complete("You are a connectivity test.", [{"role": "user", "content": "Reply with exactly: OK"}])
-    return {"reply": reply[:200], "seconds": round(time.time() - t, 1)}
+    result = {"reply": reply[:200], "seconds": round(time.time() - t, 1)}
+    if load_settings().get("embedding_mode") == "api":
+        t = time.time()
+        vector = api_embed(["connectivity test"])[0]
+        result["embedding"] = f"{len(vector):,} dimensions ({time.time() - t:.1f}s)"
+    return result
 
 
 @route("GET", f"/api/{K}")
@@ -1679,6 +1807,8 @@ def index_repository(kind, item_id, body, query):
         result = rag.index_layer(kind, item_id, path)
     except (ValueError, RuntimeError) as exc:
         raise HttpError(400, str(exc))
+    except LLMError as exc:                 # embedding API problem: say what, no traceback
+        raise HttpError(502, f"Indexing failed: {exc}")
     except Exception as exc:
         traceback.print_exc()
         raise HttpError(500, f"Indexing failed: {exc}")
@@ -2610,13 +2740,30 @@ PAGE_HTML = r"""<!doctype html>
     <label class="field">Brief guidance: what briefs should look for in project files
       <textarea id="set-guidance" rows="9"></textarea></label>
     <div class="row"><button id="btn-guidance-reset" type="button">Reset guidance to default</button></div>
-    <label class="field">Simultaneous requests while building a brief
-      <input id="set-brief-parallel" type="number" min="1" max="8" step="1"></label>
-    <label class="field">File text per card request (tokens; longer files are read in parts)
-      <input id="set-card-tokens" type="number" min="2000" step="1000"></label>
-    <div class="small muted">If brief building hits connection errors (e.g. WinError 10054,
-      "forcibly closed by the remote host"), keep simultaneous requests at 1 and lower the
-      text per request. Failed requests are retried automatically.</div>
+    <label class="field">File text per card request (tokens)
+      <input id="set-card-tokens" type="number" min="2000" step="1000"
+        placeholder="automatic (as much as the context window allows)"></label>
+    <div class="small muted">Leave blank so most files take one request. Lower it only if
+      large requests fail.</div>
+
+    <h3>Document search</h3>
+    <label class="field">Embedding model
+      <select id="set-embed-mode">
+        <option value="local">Built-in local model (no network; reads ~800 characters per passage)</option>
+        <option value="api">API embedding model (same base URL and key)</option>
+      </select></label>
+    <div id="embed-api-fields">
+      <label class="field">Embedding model name (required; set it explicitly)
+        <input id="set-embed-model" placeholder="model name as your API expects it"></label>
+      <div class="small muted" id="set-embed-endpoint"></div>
+    </div>
+    <label class="field">Passage size (characters)
+      <input id="set-chunk" type="number" min="300" step="100"
+        placeholder="automatic (800 local, 3,000 API)"></label>
+    <label class="field">Simultaneous API requests (briefs and indexing)
+      <input id="set-parallel" type="number" min="1" max="8" step="1"></label>
+    <div class="small muted">Changing the embedding model or passage size requires
+      re-indexing each folder; the editor flags folders indexed with other settings.</div>
     <div class="small muted" id="set-data-dir"></div>
     <div class="row" style="margin-top:10px">
       <button id="btn-set-test" type="button">Save &amp; test connection</button>
@@ -2812,12 +2959,19 @@ async function openSettings() {
   $("#set-docs").value = s.doc_budget || "";
   $("#set-history").value = s.history_budget || "";
   $("#set-guidance").value = s.brief_guidance || "";
-  $("#set-brief-parallel").value = s.brief_parallel || 1;
+  $("#set-parallel").value = s.parallel_requests || 4;
+  $("#set-embed-mode").value = s.embedding_mode || "local";
+  $("#set-embed-model").value = s.embedding_model || "";
+  $("#set-chunk").value = s.chunk_chars || "";
+  $("#set-embed-endpoint").textContent = s.embeddings_endpoint
+    ? `Embedding requests go to: ${s.embeddings_endpoint}` : "";
+  const syncEmbed = () => { $("#embed-api-fields").hidden = $("#set-embed-mode").value !== "api"; };
+  $("#set-embed-mode").onchange = syncEmbed; syncEmbed();
   $("#set-stream").checked = s.stream !== false;
   $("#set-stream-note").textContent = s.stream_rejected
     ? "Your gateway rejected streaming this session, so replies are being sent normally."
     : "";
-  $("#set-card-tokens").value = s.card_tokens || 12000;
+  $("#set-card-tokens").value = s.card_tokens || "";
   $("#btn-guidance-reset").onclick = () => { $("#set-guidance").value = s.default_brief_guidance; };
   $("#set-key").value = "";
   showSettings(s);
@@ -2835,7 +2989,9 @@ async function saveSettings(extra = {}) {
     base_url: $("#set-base-url").value, max_tokens: $("#set-max").value,
     context_window: $("#set-window").value, doc_budget: $("#set-docs").value,
     history_budget: $("#set-history").value, brief_guidance: $("#set-guidance").value,
-    brief_parallel: $("#set-brief-parallel").value, card_tokens: $("#set-card-tokens").value,
+    parallel_requests: $("#set-parallel").value, card_tokens: $("#set-card-tokens").value,
+    embedding_mode: $("#set-embed-mode").value, embedding_model: $("#set-embed-model").value,
+    chunk_chars: $("#set-chunk").value,
     stream: $("#set-stream").checked,
     ...extra };
   const key = $("#set-key").value.trim();
@@ -2853,7 +3009,8 @@ $("#btn-set-test").onclick = async () => {
   try {
     await saveSettings(); out.textContent = "Testing…";
     const r = await api("/api/settings/test", { json: {} });
-    out.textContent = `Connected (${r.seconds}s). Reply: ${r.reply}`;
+    out.textContent = `Connected (${r.seconds}s). Reply: ${r.reply}`
+      + (r.embedding ? ` · Embeddings OK: ${r.embedding}` : "");
   } catch (e) { out.textContent = "Failed: " + e.message; }
 };
 $("#btn-set-clear").onclick = async () => {

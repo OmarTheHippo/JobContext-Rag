@@ -34,8 +34,8 @@ py jobcontext.txt --install
 py jobcontext.txt
 ```
 
-Chroma downloads its small embedding model (all-MiniLM-L6-v2, about 80 MB) the first
-time a folder is indexed.
+With the local embedding model, Chroma downloads it (all-MiniLM-L6-v2, about 80 MB) the
+first time a folder is indexed. With an API embedding model nothing is downloaded.
 
 ## Settings
 
@@ -46,6 +46,14 @@ time a folder is indexed.
 - **Token limits.** Set the model's **context window** (the most one request can hold)
   and the reply limit; document passages and chat history are calculated from these
   unless you override them. Settings shows the breakdown.
+- **Document search.** Choose the built-in local embedding model (no network; reads
+  ~800 characters per passage) or an API embedding model on the same base URL and key
+  (requests go to `<base URL>/embeddings`; name the model explicitly). With an API
+  model, prose passages default to 3,000 characters; spreadsheet and CSV passages stay
+  around 1,000 so single rows aren't buried. Texts are sent 20 per request. Changing
+  the model or passage size requires re-indexing; the editor flags affected folders.
+- **Streaming and retries.** Replies are streamed (keeps slow requests such as briefs
+  from being cut off by proxies); dropped connections and busy responses are retried.
 - **Brief guidance.** What project briefs should look for, such as the documents a
   complete project file must contain. The repository ships a generic example; enter your
   organisation's list here (it is stored in `data\settings.json`, not in the code).
@@ -65,8 +73,7 @@ search index, settings) and is excluded from git.
 ## Known limits
 
 - Scanned PDFs have no extractable text (no OCR); such files are flagged as poorly read.
-- The embedding model reads only the first ~256 tokens of a passage, so passages are
-  kept to about 800 characters. Re-index existing folders after changing chunk settings;
-  the app flags indexes built with different settings.
+- The local embedding model reads only the first ~256 tokens of a passage, so local
+  passages are kept to about 800 characters; an API embedding model allows larger ones.
 - Briefs and answers come from a language model: treat them as a review aid and check
   them against the source documents.

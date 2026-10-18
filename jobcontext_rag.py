@@ -64,33 +64,61 @@ SUPPORTED_EXTENSIONS = {".txt", ".md", ".csv", ".pdf", ".docx", ".xlsx"}
 # Chunking is character-based because it avoids a second tokenizer dependency.
 # Token estimates use approximately four characters per token.
 #
-# Chunk size is set by the embedding model, not by the chat model. Chroma's default
-# model (all-MiniLM-L6-v2) reads only the first 256 tokens of each chunk and silently
-# ignores the rest. Measured: 256 tokens cover ~1,430 characters of prose but only
-# ~810 characters of spreadsheet rows (numbers and "|" separators cost more tokens).
-# Anything past that point can never be matched by a search, so chunks stay under it.
-# Changing these values requires re-indexing; the UI flags layers indexed with
-# different settings.
+# Embeddings and passage ("chunk") size are set from Settings via configure_search():
+# - Local model (all-MiniLM-L6-v2, built into Chroma, no network). It reads only the
+#   first 256 tokens of a passage and silently ignores the rest. Measured: 256 tokens
+#   cover ~1,430 characters of prose but only ~810 of spreadsheet rows, so local
+#   passages are capped at LOCAL_MAX_CHUNK_CHARS.
+# - An API embedding model. The app supplies the vectors; passages can be larger.
+# Each collection records which model built it (metadata "embedding"), and searches
+# refuse a mismatch with a clear "re-index" message instead of failing obscurely.
+LOCAL_EMBED_ID = "local:all-MiniLM-L6-v2"
+LOCAL_MAX_CHUNK_CHARS = 800
+
+EMBED_ID = LOCAL_EMBED_ID
 CHUNK_CHARS = 800
 CHUNK_OVERLAP_CHARS = 150
-INDEX_FORMAT = f"chunks-{CHUNK_CHARS}-{CHUNK_OVERLAP_CHARS}"
+INDEX_FORMAT = f"{EMBED_ID}|chunks-{CHUNK_CHARS}-{CHUNK_OVERLAP_CHARS}"
+_EMBED_FN: Callable[[list[str]], list[list[float]]] | None = None   # None = local model
+_QUERY_VECTORS: dict[str, list[float]] = {}                          # search phrase cache
 
-# Hybrid retrieval defaults. Chunk counts are scaled to the smaller chunk size so each
-# layer sends roughly the same amount of text as before.
+# Hybrid retrieval limits, stated for 800-character passages and scaled to the actual
+# passage size (see _scaled) so each layer sends about the same amount of text.
 CANDIDATES_PER_LAYER = 80
-MAX_CHUNKS_PER_CONTEXT = 11
-MAX_CHUNKS_PER_AGENT = 9
-MAX_CHUNKS_PER_PROJECT = int(
-    os.environ.get("JOBCTX_RAG_MAX_PROJECT_CHUNKS", "34")
-)
-MAX_TOTAL_CHUNKS = 80
+BASE_CHUNK_CHARS = 800
+BASE_MAX_CHUNKS = {
+    "contexts": 11,
+    "agents": 9,
+    "projects": int(os.environ.get("JOBCTX_RAG_MAX_PROJECT_CHUNKS", "34")),
+}
+BASE_MAX_TOTAL_CHUNKS = 80
 
 # Planner follow-up retrieval. Each planner "need" (one fact or requirement to look
 # up in one layer) is selected on its own, so a strong match for one need can never
 # push out the evidence for another. This cap applies per need.
-FOLLOWUP_MAX_CHUNKS_PER_NEED = int(
-    os.environ.get("JOBCTX_RAG_FOLLOWUP_MAX_CHUNKS", "4")
-)
+BASE_FOLLOWUP_PER_NEED = int(os.environ.get("JOBCTX_RAG_FOLLOWUP_MAX_CHUNKS", "4"))
+
+
+# Spreadsheet and CSV rows are each a separate fact (one cost line, one item), so a
+# large passage would average a single row with dozens of others and bury it. Table
+# passages therefore stay small even when prose passages are large.
+TABLE_MAX_CHUNK_CHARS = 1000
+
+
+def _table_chunk_chars() -> int:
+    return min(CHUNK_CHARS, TABLE_MAX_CHUNK_CHARS)
+
+
+def _scaled(count: int) -> int:
+    return max(2, round(count * BASE_CHUNK_CHARS / CHUNK_CHARS))
+
+
+def max_total_chunks() -> int:
+    return _scaled(BASE_MAX_TOTAL_CHUNKS)
+
+
+def followup_per_need() -> int:
+    return _scaled(BASE_FOLLOWUP_PER_NEED)
 
 # Relevance cut, measured between a need's best hit and its approximate background
 # score. A smaller value is more selective.
@@ -146,6 +174,52 @@ def configure(data_dir: str | Path) -> None:
     _EMBEDDER = None
 
 
+def configure_search(embed_fn: Callable[[list[str]], list[list[float]]] | None,
+                     embed_id: str,
+                     chunk_chars: int,
+                     overlap_chars: int | None = None) -> None:
+    """
+    Choose the embedding model and passage size (called from Settings).
+    embed_fn=None uses the local model. Indexes built with a different embed_id or
+    passage size must be re-indexed; INDEX_FORMAT lets the UI flag them.
+    """
+    global _EMBED_FN, EMBED_ID, CHUNK_CHARS, CHUNK_OVERLAP_CHARS, INDEX_FORMAT
+
+    if embed_fn is None:
+        chunk_chars = min(chunk_chars, LOCAL_MAX_CHUNK_CHARS)
+    with _LOCK:
+        _EMBED_FN = embed_fn
+        EMBED_ID = embed_id
+        CHUNK_CHARS = max(300, int(chunk_chars))
+        CHUNK_OVERLAP_CHARS = overlap_chars or max(100, CHUNK_CHARS // 6)
+        INDEX_FORMAT = f"{EMBED_ID}|chunks-{CHUNK_CHARS}-{CHUNK_OVERLAP_CHARS}"
+        _QUERY_VECTORS.clear()
+
+
+def embed(texts: list[str]) -> list[list[float]]:
+    """Vectors for texts, from the configured model (API or local)."""
+    if not texts:
+        return []
+    if _EMBED_FN is not None:
+        return [list(map(float, v)) for v in _EMBED_FN(texts)]
+    return [list(map(float, v)) for v in _get_embedder()(texts)]
+
+
+def prefetch_queries(queries: list[str]) -> None:
+    """Embed many search phrases in one go (batched), so per-search lookups are free."""
+    missing = list(dict.fromkeys(q for q in queries if q and q not in _QUERY_VECTORS))
+    if missing:
+        if len(_QUERY_VECTORS) > 5000:
+            _QUERY_VECTORS.clear()
+        _QUERY_VECTORS.update(zip(missing, embed(missing)))
+
+
+def _query_vector(query: str) -> list[float]:
+    if query not in _QUERY_VECTORS:
+        prefetch_queries([query])
+    return _QUERY_VECTORS[query]
+
+
 def available() -> dict:
     """Return dependency and configuration information for the UI."""
     return {
@@ -169,6 +243,8 @@ def status() -> dict:
     return {
         "configured": True,
         "index_format": INDEX_FORMAT,
+        "embedding": EMBED_ID,
+        "chunk_chars": CHUNK_CHARS,
         "data_dir": str(_DATA_DIR),
         "chroma_dir": str(_CHROMA_DIR),
         "extracted_dir": str(_EXTRACTED_DIR),
@@ -237,12 +313,20 @@ def _source_dir(kind: str, layer_id: str) -> Path:
     return path
 
 
-def _collection(kind: str, layer_id: str):
-    return _get_client().get_or_create_collection(
-        name=collection_name(kind, layer_id),
-        embedding_function=_get_embedder(),
-        metadata={"kind": kind, "layer_id": layer_id},
-    )
+def _collection(kind: str, layer_id: str, create: bool = False):
+    """
+    Open a layer's collection (raises if it doesn't exist), or create a new one
+    labelled with the current embedding model. The app always supplies vectors
+    itself, so Chroma's own embedding function is never used.
+    """
+    client, name = _get_client(), collection_name(kind, layer_id)
+    if create:
+        return client.create_collection(
+            name=name,
+            embedding_function=None,
+            metadata={"kind": kind, "layer_id": layer_id, "embedding": EMBED_ID},
+        )
+    return client.get_collection(name=name, embedding_function=None)
 
 
 def _delete_collection(kind: str, layer_id: str) -> None:
@@ -273,18 +357,18 @@ def _rebuild_collection(kind: str, layer_id: str):
             embeddings = None
 
         _delete_collection(kind, layer_id)
-        rebuilt = _collection(kind, layer_id)
+        rebuilt = _collection(kind, layer_id, create=True)
         ids = stored.get("ids") or []
         for start in range(0, len(ids), 100):
             end = start + 100
-            batch = {
-                "ids": ids[start:end],
-                "documents": stored["documents"][start:end],
-                "metadatas": stored["metadatas"][start:end],
-            }
-            if embeddings is not None:
-                batch["embeddings"] = embeddings[start:end]
-            rebuilt.upsert(**batch)
+            documents = stored["documents"][start:end]
+            rebuilt.upsert(
+                ids=ids[start:end],
+                documents=documents,
+                metadatas=stored["metadatas"][start:end],
+                embeddings=(embeddings[start:end] if embeddings is not None
+                            else embed(documents)),
+            )
         return rebuilt
 
 
@@ -356,7 +440,7 @@ def _read_csv(path: Path) -> list[dict]:
 
     for row_num, text in rows:
         projected = "\n".join(current + [text])
-        if current and len(projected) > CHUNK_CHARS:
+        if current and len(projected) > _table_chunk_chars():
             blocks.append({
                 "text": "\n".join(current),
                 "location": _display_location(sheet="CSV", row_start=start_row, row_end=last_row),
@@ -469,7 +553,7 @@ def _read_xlsx(path: Path) -> list[dict]:
                     start_row = row_number
 
                 projected = "\n".join(current + [line])
-                if current and len(projected) > CHUNK_CHARS:
+                if current and len(projected) > _table_chunk_chars():
                     blocks.append({
                         "text": "\n".join(current),
                         "location": _display_location(
@@ -772,7 +856,7 @@ def index_layer(kind: str,
     with _LOCK:
         _delete_collection(kind, layer_id)
         _clear_extracted_sources(kind, layer_id)
-        collection = _collection(kind, layer_id)
+        collection = _collection(kind, layer_id, create=True)
 
         indexed_files = 0
         indexed_chunks = 0
@@ -788,10 +872,12 @@ def index_layer(kind: str,
             if not ids:
                 return
 
+            # Vectors come from the configured model (API calls are batched there).
             collection.upsert(
                 ids=ids,
                 documents=documents,
                 metadatas=metadatas,
+                embeddings=embed(documents),
             )
             ids = []
             documents = []
@@ -858,7 +944,7 @@ def index_layer(kind: str,
                     "sequence": sequence,
                 })
 
-                if len(ids) >= 100:
+                if len(ids) >= 160:          # 8 API batches of 20, run in parallel
                     flush()
 
             indexed_files += 1
@@ -899,6 +985,8 @@ def layer_index_status(kind: str, layer_id: str) -> dict:
         collection = _collection(kind, layer_id)
         chunks = collection.count()
     except Exception as exc:
+        if "does not exist" in str(exc).lower():
+            return {"status": "empty", "chunk_count": 0, "file_count": 0, "error": ""}
         return {
             "status": "error",
             "chunk_count": 0,
@@ -921,11 +1009,7 @@ def layer_index_status(kind: str, layer_id: str) -> dict:
 # -----------------------------------------------------------------------------
 
 def _layer_limit(kind: str) -> int:
-    return {
-        "contexts": MAX_CHUNKS_PER_CONTEXT,
-        "agents": MAX_CHUNKS_PER_AGENT,
-        "projects": MAX_CHUNKS_PER_PROJECT,
-    }.get(kind, 4)
+    return _scaled(BASE_MAX_CHUNKS.get(kind, 4))
 
 
 def _layer_label(kind: str) -> str:
@@ -966,14 +1050,23 @@ def _query_layer(kind: str,
     if count <= 0:
         return []
 
+    # A search vector only matches an index built by the same model.
+    built_with = (collection.metadata or {}).get("embedding", LOCAL_EMBED_ID)
+    if built_with != EMBED_ID:
+        raise RuntimeError(
+            f"'{layer.get('name', layer['id'])}' was indexed with a different embedding "
+            f"model ({built_with}). Re-index its folder to use the current one ({EMBED_ID}).")
+
     where = None
     if file_names:
         where = ({"file_name": file_names[0]} if len(file_names) == 1
                  else {"file_name": {"$in": list(file_names)}})
 
+    vector = _query_vector(query)
+
     def run():
         return collection.query(
-            query_texts=[query],
+            query_embeddings=[vector],
             n_results=min(candidate_count, count),
             include=["documents", "metadatas", "distances"],
             where=where,
@@ -1050,7 +1143,7 @@ def _adaptive_layer_selection(records: list[dict], limit: int) -> list[dict]:
     return selected
 
 def _select_followup_records(records: list[dict],
-                             limit: int = FOLLOWUP_MAX_CHUNKS_PER_NEED) -> list[dict]:
+                             limit: int | None = None) -> list[dict]:
     """
     Select focused evidence for ONE planner need.
 
@@ -1064,6 +1157,8 @@ def _select_followup_records(records: list[dict],
     to find a specific fact, so weak distractors are dropped when relevance clearly
     falls away.
     """
+    if limit is None:
+        limit = followup_per_need()
     if not records or limit <= 0:
         return []
 
@@ -1180,7 +1275,7 @@ def retrieve_hybrid(chat: dict,
         block = _format_block(record)
         block_tokens = _estimate_tokens(block)
 
-        if len(kept) >= MAX_TOTAL_CHUNKS:
+        if len(kept) >= max_total_chunks():
             break
 
         if tokens_used + block_tokens > token_budget:
@@ -1343,6 +1438,11 @@ def retrieve_followup(chat: dict,
         for kind, layer in _selected_layers(chat, load_layer)
     }
 
+    # Embed every search phrase up front in batched requests (with an API embedding
+    # model that is 1-2 requests for the whole plan instead of one per search).
+    prefetch_queries([q for need in needs for q in need.get("queries", [])
+                      if isinstance(q, str) and q.strip()])
+
     need_notes = []
     ranked_per_need = []
     searched_layers = []
@@ -1424,7 +1524,7 @@ def retrieve_followup(chat: dict,
                     existing["needs"].append(label)
                 continue
 
-            if len(kept) >= MAX_TOTAL_CHUNKS:
+            if len(kept) >= max_total_chunks():
                 continue
 
             block = _format_block(record)
@@ -1451,7 +1551,7 @@ def retrieve_followup(chat: dict,
             "estimated_tokens": tokens_used,
             "token_budget": token_budget,
             "selection": {
-                "max_chunks_per_need": FOLLOWUP_MAX_CHUNKS_PER_NEED,
+                "max_chunks_per_need": followup_per_need(),
                 "knee_span": FOLLOWUP_KNEE_SPAN,
                 "weak_signal_margin": FOLLOWUP_WEAK_SIGNAL_MARGIN,
             },
