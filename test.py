@@ -163,7 +163,6 @@ def test_embeddings(app, out):
         out("  -> Direct works but the system proxy route fails: the proxy is the problem.")
         out("     Tell Claude; the app can be set to bypass it.")
     out("")
-    out("  Request shapes (via the system proxy, as the app sends them):")
 
     def body(texts, b64):
         b = {"model": model, "input": texts}
@@ -182,30 +181,36 @@ def test_embeddings(app, out):
         except Exception:                                   # noqa: BLE001
             return "(reply not readable as embeddings)"
 
+    # 2. Request shapes, all DIRECT, changing one thing at a time. The timings of the
+    #    ones that work matter as much as which fail: if successes slow down as
+    #    requests grow and failures all stop near the same time, the gateway has a
+    #    time limit for non-streamed requests.
     cases = [
         # label, texts, base64?, headers
-        ("1 short text, plain numbers", sample(200, 1), False, plain),
-        ("1 short text, base64 + gzip", sample(200, 1), True, compact),
-        ("5 x 1,000 chars, plain numbers", sample(1000, 5), False, plain),
-        ("5 x 1,000 chars, base64 + gzip", sample(1000, 5), True, compact),
-        ("20 x 1,000 chars, plain numbers", sample(1000, 20), False, plain),
-        ("20 x 1,000 chars, base64 + gzip", sample(1000, 20), True, compact),
-        ("20 x 3,000 chars, base64 + gzip", sample(3000, 20), True, compact),
-        ("20 x 1,000 chars, plain, other User-Agent", sample(1000, 20), False,
-         dict(plain, **{"User-Agent": "JobContext-test/1.0"})),
+        ("1 x 200 chars, plain numbers", sample(200, 1), False, plain),
+        ("1 x 200 chars, base64", sample(200, 1), True, plain),
+        ("1 x 200 chars, plain + gzip/Accept headers", sample(200, 1), False, compact),
+        ("1 x 1,000 chars", sample(1000, 1), False, plain),
+        ("1 x 3,000 chars", sample(3000, 1), False, plain),
+        ("1 x 12,000 chars", sample(12000, 1), False, plain),
+        ("5 x 200 chars", sample(200, 5), False, plain),
+        ("20 x 200 chars", sample(200, 20), False, plain),
+        ("5 x 1,000 chars", sample(1000, 5), False, plain),
+        ("20 x 1,000 chars", sample(1000, 20), False, plain),
     ]
     results = {}
+    out("  Request shapes (direct; one thing changed at a time):")
     out(f"  Each request waits up to {TIMEOUT:.0f}s. Requests that hang will take that long.")
     for label, texts, b64, headers in cases:
-        r = probe(url, body(texts, b64), headers)
+        r = probe(url, body(texts, b64), headers, direct=True)
         results[label] = r
         out(line(label, r, dims(r) if r["ok"] else ""))
 
-    # Several at once, as the app does while indexing.
-    out("  4 requests at once (5 x 1,000 chars each, base64 + gzip):")
+    # 3. Several at once, as the app does while indexing.
+    out("  4 requests at once (direct, 1 x 200 chars each):")
     parallel = []
     threads = [threading.Thread(target=lambda: parallel.append(
-        probe(url, body(sample(1000, 5), True), compact))) for _ in range(4)]
+        probe(url, body(sample(200, 1), False), plain, direct=True))) for _ in range(4)]
     for t in threads:
         t.start()
     for t in threads:
@@ -213,37 +218,33 @@ def test_embeddings(app, out):
     for i, r in enumerate(parallel, 1):
         out(line(f"   at once #{i}", r))
 
-    # The app's own code path (one attempt, no retries).
-    out("  The app's own embedding call (20 x 1,000 chars, one attempt):")
-    started = time.time()
-    try:
-        vectors = app._genai_embed(sample(1000, 20), s, attempts=1)
-        out(f"  OK    app._genai_embed                             {time.time() - started:.1f}s, "
-            f"{len(vectors)} vectors of {len(vectors[0])} dims, format used: {app._EMBED_FORMAT[0]}")
-    except Exception as e:                                   # noqa: BLE001
-        out(f"  FAIL  app._genai_embed                             after {time.time() - started:.1f}s - {e}")
+    # 4. The app's own code path (its Settings route, one attempt, no retries).
+    for n in (1, 20):
+        label = f"app._genai_embed, {n} x 1,000 chars"
+        started = time.time()
+        try:
+            vectors = app._genai_embed(sample(1000, n), s, attempts=1)
+            out(f"  OK    {label:<46} {time.time() - started:.1f}s, {len(vectors)} vectors of "
+                f"{len(vectors[0])} dims, format used: {app._EMBED_FORMAT[0]}")
+        except Exception as e:                               # noqa: BLE001
+            out(f"  FAIL  {label:<46} after {time.time() - started:.1f}s - {str(e)[:160]}")
 
     # What the pattern suggests.
-    ok = {k: v["ok"] for k, v in results.items()}
+    oks = [(k, v["total"]) for k, v in results.items() if v["ok"]]
+    fails = [v["total"] for v in results.values() if not v["ok"]]
     out("")
     out("  What this suggests:")
-    if not any(ok.values()):
-        out("  - Nothing worked, even one short text: check the endpoint, model name and key,")
-        out("    and whether the gateway expects a different request format or path.")
-    elif ok["20 x 1,000 chars, base64 + gzip"] and not ok["20 x 1,000 chars, plain numbers"]:
-        out("  - Large plain-number replies fail but compact ones work: reply size is the")
-        out("    problem. The app now asks for base64 + gzip, which should fix indexing.")
-    elif not ok["20 x 1,000 chars, plain numbers"] and ok["20 x 1,000 chars, plain, other User-Agent"]:
-        out("  - The same request works with a different User-Agent: the gateway or proxy is")
-        out("    treating Python's default User-Agent differently. Tell Claude.")
-    elif all(ok.values()) and all(r["ok"] for r in parallel):
-        out("  - Everything worked here. If indexing still fails, the difference is in how many")
-        out("    requests run back to back; send this file and the app's console log.")
-    elif all(ok.values()):
-        out("  - Single requests work but several at once fail: set Settings > Simultaneous")
-        out("    API requests to 1.")
-    else:
-        out("  - Mixed results: send this file to Claude.")
+    if oks:
+        out(f"  - Successful requests took {min(t for _, t in oks):.1f}s to "
+            f"{max(t for _, t in oks):.1f}s (slowest: {max(oks, key=lambda x: x[1])[0]}).")
+    if fails:
+        out(f"  - Failed requests stopped after {min(fails):.0f}s to {max(fails):.0f}s.")
+    if fails and max(fails) - min(fails) < 5 and min(fails) > 30:
+        out("  - Failures all stop at about the same time: likely a time limit on")
+        out("    non-streamed requests. The largest shape that worked is a safe batch size.")
+    if not oks:
+        out("  - Nothing worked directly either: send this file to Claude.")
+    out("  Send this file to Claude.")
 
 
 # ---- chat ------------------------------------------------------------------------------
@@ -264,25 +265,38 @@ def test_chat(app, out):
     for label, direct in (("via system proxy", False), ("direct, bypassing system proxy", True)):
         out(line(label, probe(url, {"model": model, "messages": short, "max_tokens": 50},
                               headers, direct=direct)))
-    out("  Reply types (direct, as the app now connects by default):")
+    # Same short question, different reply limits: if larger limits fail although the
+    # reply is still "OK", the model is probably spending time before answering (e.g.
+    # hidden reasoning), and non-streamed requests run into a time limit.
+    out("  Reply limit (max_tokens), same short question, direct:")
+    for limit in (50, 500, 2000, 8000):
+        for stream in (False, True):
+            body = {"model": model, "messages": short, "max_tokens": limit}
+            if stream:
+                body["stream"] = True
+            r = probe(url, body, headers, stream=stream, direct=True)
+            label = f"max_tokens {limit:,}, {'streamed' if stream else 'plain'}"
+            extra = ""
+            if r["ok"] and not stream:
+                try:
+                    usage = json.loads(r["raw"]).get("usage") or {}
+                    details = usage.get("completion_tokens_details") or {}
+                    extra = (f"(reply tokens {usage.get('completion_tokens', '?')}, reasoning "
+                             f"tokens {details.get('reasoning_tokens', 'not reported')})")
+                except Exception:                            # noqa: BLE001
+                    pass
+            elif r["ok"] and r["first_piece_at"] is not None:
+                extra = f"(first piece after {r['first_piece_at']:.1f}s)"
+            out(line(label, r, extra))
     long_ = [{"role": "user", "content": "Write about 600 words describing how to plan a "
                                           "routine equipment inspection. Plain prose."}]
-    for label, messages, stream in (
-        ("short reply, plain", short, False),
-        ("short reply, streamed", short, True),
-        ("long reply (~600 words), plain", long_, False),
-        ("long reply (~600 words), streamed", long_, True),
-    ):
-        body = {"model": model, "messages": messages, "max_tokens": 2000}
+    out("  Long reply (~600 words), max_tokens 2,000, direct:")
+    for stream in (False, True):
+        body = {"model": model, "messages": long_, "max_tokens": 2000}
         if stream:
             body["stream"] = True
         r = probe(url, body, headers, stream=stream, direct=True)
-        extra = ""
-        if r["ok"] and stream:
-            first = r["first_piece_at"]
-            extra = (f"(first piece after {first:.1f}s, type {r.get('content_type', '')})"
-                     if first is not None else "")
-        out(line(label, r, extra))
+        out(line("streamed" if stream else "plain", r))
 
 
 TESTS = {"embeddings": test_embeddings, "chat": test_chat}
