@@ -50,7 +50,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.2.2"
+APP_VERSION = "3.3.0"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -206,6 +206,8 @@ DEFAULT_SETTINGS = {
     "chunk_chars": 0,
     # Ask the API to stream replies (see _genai_complete); keeps slow requests alive.
     "stream": True,
+    # How requests reach the API: "env" (default), "system" or "none"; see _open().
+    "proxy_mode": "env",
 }
 
 # Automatic shares of the context window, used when the overrides are 0.
@@ -391,6 +393,43 @@ def _chat_endpoint(s: dict) -> str:
         return ""
     return base if base.endswith(CHAT_PATH) else base + CHAT_PATH
 
+# How API requests reach the gateway (Settings > Network). Python's urllib normally
+# also uses the proxy configured in Windows' internet settings; on some agency
+# networks that proxy holds non-streamed requests until they are dropped (~90 s,
+# WinError 10054). Most API client libraries (e.g. openai) ignore the Windows setting
+# and only honour HTTPS_PROXY / HTTP_PROXY environment variables, so that is the
+# default here too.
+PROXY_MODES = {
+    "env": "Like most API clients: ignore Windows proxy settings (HTTPS_PROXY still applies)",
+    "system": "Use Windows proxy settings",
+    "none": "No proxy at all",
+}
+
+
+def _proxies(mode: str) -> dict:
+    if mode == "system":
+        return urllib.request.getproxies()                 # environment, then Windows
+    if mode == "none":
+        return {}
+    return urllib.request.getproxies_environment()          # "env" (default)
+
+
+def _open(req, timeout: float):
+    """urlopen through the proxy route chosen in Settings."""
+    mode = load_settings().get("proxy_mode", "env")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(_proxies(mode)))
+    return opener.open(req, timeout=timeout)
+
+
+def _windows_proxy() -> str:
+    """The proxy Windows' internet settings name (host only), for display."""
+    try:
+        found = urllib.request.getproxies_registry() if os.name == "nt" else {}
+    except Exception:
+        found = {}
+    return ", ".join(sorted({v.split("@")[-1] for v in found.values()})) or "none"
+
+
 _STREAM_REJECTED = [False]           # set if the gateway refuses "stream": true
 
 
@@ -507,7 +546,7 @@ def _genai_complete(system: str, messages: list, s: dict, attempts: int | None =
         attempt += 1
         started = time.time()
         try:
-            with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
+            with _open(req, timeout=API_TIMEOUT_SECONDS) as r:
                 if "text/event-stream" in (r.headers.get("Content-Type") or ""):
                     data = {"choices": [{"message": {"content": _read_stream(r)}}]}
                 else:
@@ -635,7 +674,7 @@ def _genai_embed(texts: list[str], s: dict, attempts: int | None = None) -> list
         attempt += 1
         started, reply_at, received = time.time(), None, {"bytes": 0}
         try:
-            with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
+            with _open(req, timeout=API_TIMEOUT_SECONDS) as r:
                 reply_at = time.time() - started
                 raw, received = _read_reply(r)
             data = json.loads(raw)
@@ -1748,6 +1787,9 @@ def get_settings(body, query):
             "chunk_chars": s.get("chunk_chars") or 0,
             "chunk_chars_effective": rag.CHUNK_CHARS,
             "stream": s.get("stream", True),
+            "proxy_mode": s.get("proxy_mode", "env"),
+            "proxy_modes": PROXY_MODES,
+            "windows_proxy": _windows_proxy(),
             "stream_rejected": _STREAM_REJECTED[0],
             "card_tokens": s.get("card_tokens") or 0,
             "default_brief_guidance": DEFAULT_BRIEF_GUIDANCE,
@@ -1786,6 +1828,8 @@ def set_settings(body, query):
         s["brief_guidance"] = str(body["brief_guidance"]).strip()
     if "stream" in body:
         s["stream"] = bool(body["stream"])
+    if body.get("proxy_mode") in PROXY_MODES:
+        s["proxy_mode"] = body["proxy_mode"]
     if body.get("embedding_mode") in ("local", "api"):
         s["embedding_mode"] = body["embedding_mode"]
     if "embedding_model" in body:
@@ -2867,6 +2911,9 @@ PAGE_HTML = r"""<!doctype html>
     <div class="small muted" id="set-key-status"></div>
     <label class="field">Max reply tokens
       <input id="set-max" type="number" min="256" step="256"></label>
+    <label class="field">Network route to the API
+      <select id="set-proxy"></select></label>
+    <div class="small muted" id="set-proxy-note"></div>
     <label><input id="set-stream" type="checkbox"> Stream replies (recommended: keeps slow
       requests such as briefs from being cut off by proxies)</label>
     <div class="small muted" id="set-stream-note"></div>
@@ -3115,6 +3162,11 @@ async function openSettings() {
   const syncEmbed = () => { $("#embed-api-fields").hidden = $("#set-embed-mode").value !== "api"; };
   $("#set-embed-mode").onchange = syncEmbed; syncEmbed();
   $("#set-stream").checked = s.stream !== false;
+  $("#set-proxy").innerHTML = Object.entries(s.proxy_modes || {})
+    .map(([value, label]) => `<option value="${value}">${esc(label)}</option>`).join("");
+  $("#set-proxy").value = s.proxy_mode || "env";
+  $("#set-proxy-note").textContent = `Proxy in Windows internet settings: ${s.windows_proxy}.`
+    + " If requests fail with WinError 10054 after ~90 s, avoid routing through it.";
   $("#set-stream-note").textContent = s.stream_rejected
     ? "Your gateway rejected streaming this session, so replies are being sent normally."
     : "";
@@ -3139,7 +3191,7 @@ async function saveSettings(extra = {}) {
     parallel_requests: $("#set-parallel").value, card_tokens: $("#set-card-tokens").value,
     embedding_mode: $("#set-embed-mode").value, embedding_model: $("#set-embed-model").value,
     chunk_chars: $("#set-chunk").value,
-    stream: $("#set-stream").checked,
+    stream: $("#set-stream").checked, proxy_mode: $("#set-proxy").value,
     ...extra };
   const key = $("#set-key").value.trim();
   if (key) body.api_key = key;

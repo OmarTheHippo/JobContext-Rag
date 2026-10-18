@@ -259,6 +259,12 @@ def test_chat(app, out):
         return
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
     short = [{"role": "user", "content": "Reply with exactly: OK"}]
+    out(f"  app's network route (Settings): {s.get('proxy_mode', 'env')}")
+    out("  How the request travels (short reply, not streamed):")
+    for label, direct in (("via system proxy", False), ("direct, bypassing system proxy", True)):
+        out(line(label, probe(url, {"model": model, "messages": short, "max_tokens": 50},
+                              headers, direct=direct)))
+    out("  Reply types (direct, as the app now connects by default):")
     long_ = [{"role": "user", "content": "Write about 600 words describing how to plan a "
                                           "routine equipment inspection. Plain prose."}]
     for label, messages, stream in (
@@ -270,7 +276,7 @@ def test_chat(app, out):
         body = {"model": model, "messages": messages, "max_tokens": 2000}
         if stream:
             body["stream"] = True
-        r = probe(url, body, headers, stream=stream)
+        r = probe(url, body, headers, stream=stream, direct=True)
         extra = ""
         if r["ok"] and stream:
             first = r["first_piece_at"]

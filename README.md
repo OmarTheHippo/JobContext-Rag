@@ -52,6 +52,11 @@ first time a folder is indexed. With an API embedding model nothing is downloade
   model, prose passages default to 3,000 characters; spreadsheet and CSV passages stay
   around 1,000 so single rows aren't buried. Texts are sent 20 per request. Changing
   the model or passage size requires re-indexing; the editor flags affected folders.
+- **Network route.** By default the app connects like most API client libraries:
+  it ignores the proxy in Windows' internet settings and only honours `HTTPS_PROXY` /
+  `HTTP_PROXY` environment variables. Some agency proxies hold non-streamed requests
+  until they are dropped (WinError 10054 after ~90 s); `py test.py embeddings` shows
+  whether that is happening. Settings can switch to the Windows proxy or to no proxy.
 - **Streaming and retries.** Replies are streamed (keeps slow requests such as briefs
   from being cut off by proxies); dropped connections and busy responses are retried.
 - **Brief guidance.** What project briefs should look for, such as the documents a
