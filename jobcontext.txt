@@ -26,7 +26,9 @@
 import jobcontext_rag as rag
 import base64
 import hashlib
+import http.client
 import json
+import random
 import os
 import re
 import shutil
@@ -45,7 +47,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -188,6 +190,11 @@ DEFAULT_SETTINGS = {
     "doc_budget": 0,
     "history_budget": 0,
     "brief_guidance": DEFAULT_BRIEF_GUIDANCE,
+    # Project briefs: simultaneous API requests, and the most file text one card
+    # request carries (longer files are read in parts). Small, sequential requests
+    # are the most reliable through strict gateways and proxies.
+    "brief_parallel": 1,
+    "card_tokens": 12000,
 }
 
 # Automatic shares of the context window, used when the overrides are 0.
@@ -363,6 +370,22 @@ def _chat_endpoint(s: dict) -> str:
         return ""
     return base if base.endswith(CHAT_PATH) else base + CHAT_PATH
 
+API_ATTEMPTS = 4                     # first try + 3 retries
+API_TIMEOUT_SECONDS = 300
+RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _retry_wait(attempt: int, retry_after: str | None = None) -> float:
+    """Seconds before retry number `attempt`+1: the server's Retry-After if it sent
+    one (capped at 60 s), else 2, 4, 8 s with a little jitter."""
+    try:
+        if retry_after:
+            return min(60.0, max(1.0, float(retry_after)))
+    except ValueError:
+        pass
+    return 2 ** attempt + random.uniform(0, 1)
+
+
 def _genai_complete(system: str, messages: list, s: dict) -> str:
     """Calls the GenAI API using the common "chat completions" JSON shape:
         POST <base URL>/chat/completions   Authorization: Bearer <API key>
@@ -399,15 +422,40 @@ def _genai_complete(system: str, messages: list, s: dict) -> str:
         )
     headers = {"Content-Type": "application/json",
                "Authorization": f"Bearer {key}"}                  # <-- 2. auth header
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=300) as r:
-            data = json.load(r)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:500]
-        raise LLMError(f"GenAI API error {e.code}: {detail}")
-    except urllib.error.URLError as e:
-        raise LLMError(f"Couldn't reach the GenAI API: {e.reason}")
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=payload, headers=headers)
+    size = f"request ~{len(payload) // 4:,} tokens"
+
+    # Gateways and proxies sometimes drop a connection (WinError 10054 "forcibly
+    # closed by the remote host"), time out, or answer 429/5xx when busy. Those are
+    # retried with growing waits; anything else (bad key, bad request) fails at once.
+    for attempt in range(1, API_ATTEMPTS + 1):
+        started = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
+                data = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:500]
+            if e.code not in RETRYABLE_HTTP_STATUS or attempt == API_ATTEMPTS:
+                raise LLMError(f"GenAI API error {e.code}: {detail}"
+                               + (f" (after {attempt} attempts, {size})" if attempt > 1 else ""))
+            wait = _retry_wait(attempt, e.headers.get("Retry-After"))
+            problem = f"HTTP {e.code}"
+        except (urllib.error.URLError, ConnectionError, TimeoutError,
+                http.client.HTTPException, ValueError) as e:
+            # ValueError covers a reply cut off mid-JSON.
+            reason = getattr(e, "reason", None) or e
+            problem = f"{type(reason).__name__}: {reason}"
+            if attempt == API_ATTEMPTS:
+                raise LLMError(
+                    f"Connection to the GenAI API failed after {attempt} attempts "
+                    f"({problem}; last attempt ran {time.time() - started:.0f}s; {size}). "
+                    "If this keeps happening, see Settings > Project briefs.")
+            wait = _retry_wait(attempt)
+        print(f"GenAI request failed ({problem}; {size}); retry {attempt + 1} of "
+              f"{API_ATTEMPTS} in {wait:.0f}s", flush=True)
+        time.sleep(wait)
     try:
         return data["choices"][0]["message"]["content"]           # <-- 3. reply text
     except (KeyError, IndexError, TypeError):
@@ -983,8 +1031,6 @@ def build_update_request(layer: dict, kind: str, chat: dict, instruction: str) -
 # The brief is stored on the Project (layer["brief"]), separate from the layer prompt,
 # so regenerating it never touches what you wrote.
 
-BRIEF_PARALLEL_CALLS = 4
-
 CARD_SYSTEM = """\
 You read one project document and write a short, factual file card for it. The card
 is used to build a project brief and to decide which file to search later. Use only
@@ -1088,8 +1134,11 @@ def make_file_card(source: dict, guidance: str) -> dict:
     One file card. Files longer than one request can hold are read in parts and the
     part cards are merged locally (lists combined, first part's type/title kept).
     """
+    # Never more than the context window allows, and never more than the Settings cap.
     limits = budgets()
-    part_chars = max(20_000, int((limits["context_window"] - limits["reply"] - 6_000) * 4 * 0.85))
+    fits = int((limits["context_window"] - limits["reply"] - 6_000) * 4 * 0.85)
+    wanted = int(load_settings().get("card_tokens") or 12000) * 4
+    part_chars = max(8_000, min(fits, wanted))
     text = source["text"]
     parts = [text[i:i + part_chars] for i in range(0, len(text), part_chars)] or [""]
 
@@ -1133,7 +1182,17 @@ def _brief_worker(layer_id: str) -> None:
             if old.name not in wanted:
                 old.unlink(missing_ok=True)
 
-        todo = [(name, s) for name, s in wanted.items() if not (cards_dir / name).exists()]
+        def done(name):
+            # A card that failed (e.g. a dropped connection) is redone next time.
+            path = cards_dir / name
+            if not path.exists():
+                return False
+            try:
+                return not json.loads(path.read_text(encoding="utf-8")).get("error")
+            except ValueError:
+                return False
+
+        todo = [(name, s) for name, s in wanted.items() if not done(name)]
         _brief_job_update(layer_id, total=len(sources), done=len(sources) - len(todo),
                           phase="Reading files")
 
@@ -1151,7 +1210,8 @@ def _brief_worker(layer_id: str) -> None:
             with BRIEF_LOCK:
                 BRIEF_JOBS[layer_id]["done"] = BRIEF_JOBS[layer_id].get("done", 0) + 1
 
-        with ThreadPoolExecutor(max_workers=BRIEF_PARALLEL_CALLS) as pool:
+        parallel = max(1, min(8, int(load_settings().get("brief_parallel") or 1)))
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
             list(pool.map(run, todo))
 
         records = [json.loads((cards_dir / name).read_text(encoding="utf-8")) for name in wanted]
@@ -1165,7 +1225,8 @@ def _brief_worker(layer_id: str) -> None:
             [dict(r["card"], file=r["relative_path"]) for r in usable],
             indent=1, ensure_ascii=False,
         )
-        failed_note = ("\n\nThese files could not be read (list them under Gaps):\n- "
+        failed_note = ("\n\nThese files could not be summarised because of an error "
+                       "(list them under Gaps as not yet reviewed):\n- "
                        + "\n- ".join(failed)) if failed else ""
         text = complete(BRIEF_SYSTEM.replace("<<GUIDANCE>>", guidance),
                         [{"role": "user", "content": f"File cards:\n{cards_text}{failed_note}"}])
@@ -1297,6 +1358,8 @@ def get_settings(body, query):
             "doc_budget": s.get("doc_budget") or 0,
             "history_budget": s.get("history_budget") or 0,
             "brief_guidance": s.get("brief_guidance", DEFAULT_BRIEF_GUIDANCE),
+            "brief_parallel": s.get("brief_parallel") or 1,
+            "card_tokens": s.get("card_tokens") or 12000,
             "default_brief_guidance": DEFAULT_BRIEF_GUIDANCE,
             "budgets": budgets(s)}
 
@@ -1315,6 +1378,8 @@ def set_settings(body, query):
         ("context_window", "Context window", 8000, False),
         ("doc_budget", "Document passages budget", 1000, True),
         ("history_budget", "Chat history budget", 1000, True),
+        ("brief_parallel", "Brief: simultaneous requests", 1, False),
+        ("card_tokens", "Brief: file text per request", 2000, False),
     ):
         if field not in body:
             continue
@@ -2371,6 +2436,13 @@ PAGE_HTML = r"""<!doctype html>
     <label class="field">Brief guidance: what briefs should look for in project files
       <textarea id="set-guidance" rows="9"></textarea></label>
     <div class="row"><button id="btn-guidance-reset" type="button">Reset guidance to default</button></div>
+    <label class="field">Simultaneous requests while building a brief
+      <input id="set-brief-parallel" type="number" min="1" max="8" step="1"></label>
+    <label class="field">File text per card request (tokens; longer files are read in parts)
+      <input id="set-card-tokens" type="number" min="2000" step="1000"></label>
+    <div class="small muted">If brief building hits connection errors (e.g. WinError 10054,
+      "forcibly closed by the remote host"), keep simultaneous requests at 1 and lower the
+      text per request. Failed requests are retried automatically.</div>
     <div class="small muted" id="set-data-dir"></div>
     <div class="row" style="margin-top:10px">
       <button id="btn-set-test" type="button">Save &amp; test connection</button>
@@ -2566,6 +2638,8 @@ async function openSettings() {
   $("#set-docs").value = s.doc_budget || "";
   $("#set-history").value = s.history_budget || "";
   $("#set-guidance").value = s.brief_guidance || "";
+  $("#set-brief-parallel").value = s.brief_parallel || 1;
+  $("#set-card-tokens").value = s.card_tokens || 12000;
   $("#btn-guidance-reset").onclick = () => { $("#set-guidance").value = s.default_brief_guidance; };
   $("#set-key").value = "";
   showSettings(s);
@@ -2583,6 +2657,7 @@ async function saveSettings(extra = {}) {
     base_url: $("#set-base-url").value, max_tokens: $("#set-max").value,
     context_window: $("#set-window").value, doc_budget: $("#set-docs").value,
     history_budget: $("#set-history").value, brief_guidance: $("#set-guidance").value,
+    brief_parallel: $("#set-brief-parallel").value, card_tokens: $("#set-card-tokens").value,
     ...extra };
   const key = $("#set-key").value.trim();
   if (key) body.api_key = key;
@@ -3512,7 +3587,8 @@ async function loadBrief(layerId) {
       lines.push("Out of date: the project's files or the brief guidance changed since. Regenerate to update.");
     }
     if ((brief.failed || []).length) {
-      lines.push(`${brief.failed.length} file(s) could not be read; see the brief's Gaps section.`);
+      lines.push(`${brief.failed.length} file card(s) failed (see File cards below), so the brief`
+        + " leaves those files out. Regenerate retries only the failed ones.");
     }
   } else if (!running) {
     lines.push(info.indexed_files
