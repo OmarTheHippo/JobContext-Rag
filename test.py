@@ -2,6 +2,7 @@
 
 Run from the app folder (next to jobcontext.txt), after Settings are saved in the app:
 
+    py test.py openai          # the app's requests sent through the openai library
     py test.py embeddings      # embedding model: which request shapes work or hang
     py test.py chat            # chat model: plain vs streamed replies, short vs long
     py test.py all
@@ -54,13 +55,15 @@ def load_app():
 
 
 class Out:
-    """Prints and keeps every line for the results file."""
-    def __init__(self):
-        self.lines = []
+    """Prints each line and appends it to the results file straight away, so a run
+    stopped with Ctrl+C still leaves its results."""
+    def __init__(self, path: Path):
+        self.path = path
 
     def __call__(self, text=""):
         print(text, flush=True)
-        self.lines.append(text)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(text + "\n")
 
 
 # Python's urllib (used by the app) routes requests through the proxy set in Windows'
@@ -299,7 +302,66 @@ def test_chat(app, out):
         out(line("streamed" if stream else "plain", r))
 
 
-TESTS = {"embeddings": test_embeddings, "chat": test_chat}
+# ---- openai library ---------------------------------------------------------------------
+
+def test_openai(app, out):
+    """The requests the app needs, sent through the openai library (what worked in
+    the Cline test), to see whether switching the app to it would fix things."""
+    out("OPENAI LIBRARY")
+    try:
+        import openai
+    except ImportError:
+        out("  The openai library is not installed: py -m pip install openai")
+        return
+    s = app.load_settings()
+    key = app.get_api_key()
+    base = app._chat_endpoint(s)
+    base = base[: -len(app.CHAT_PATH)] if base.endswith(app.CHAT_PATH) else base
+    chat_model, embed_model = app._model(s), (s.get("embedding_model") or "").strip()
+    out(f"  openai library {getattr(openai, '__version__', '?')}, base URL {base}")
+    out(f"  chat model {chat_model or '(not set!)'}, embedding model {embed_model or '(not set!)'}")
+    client = openai.OpenAI(base_url=base, api_key=key, timeout=TIMEOUT, max_retries=0)
+
+    def timed(label, fn):
+        started = time.time()
+        try:
+            detail = fn()
+            out(f"  OK    {label:<46} {time.time() - started:.1f}s {detail}")
+        except Exception as e:                               # noqa: BLE001
+            out(f"  FAIL  {label:<46} after {time.time() - started:.1f}s - "
+                f"{type(e).__name__}: {str(e)[:150]}")
+
+    if embed_model:
+        for n, chars in ((1, 200), (5, 1000), (20, 1000), (20, 3000)):
+            timed(f"embeddings {n} x {chars:,} chars",
+                  lambda n=n, chars=chars: "({} vectors of {} dims)".format(
+                      *(lambda r: (len(r.data), len(r.data[0].embedding)))(
+                          client.embeddings.create(model=embed_model, input=sample(chars, n)))))
+
+    if chat_model:
+        short = [{"role": "user", "content": "Reply with exactly: OK"}]
+        long_ = [{"role": "user", "content": "Write about 600 words describing how to plan a "
+                                              "routine equipment inspection. Plain prose."}]
+
+        def plain(messages):
+            r = client.chat.completions.create(model=chat_model, messages=messages, max_tokens=2000)
+            return f"({len(r.choices[0].message.content or '')} chars)"
+
+        def streamed(messages):
+            text = ""
+            for chunk in client.chat.completions.create(model=chat_model, messages=messages,
+                                                        max_tokens=2000, stream=True):
+                if chunk.choices and chunk.choices[0].delta.content:
+                    text += chunk.choices[0].delta.content
+            return f"({len(text)} chars)"
+
+        timed("chat short, plain, max_tokens 2,000", lambda: plain(short))
+        timed("chat short, streamed", lambda: streamed(short))
+        timed("chat long (~600 words), plain", lambda: plain(long_))
+        timed("chat long (~600 words), streamed", lambda: streamed(long_))
+
+
+TESTS = {"openai": test_openai, "embeddings": test_embeddings, "chat": test_chat}
 
 
 def main():
@@ -314,17 +376,19 @@ def main():
     if "all" in names:
         names = list(TESTS)
 
-    out = Out()
+    path = HERE / time.strftime("test-results-%Y%m%d-%H%M.txt")
+    out = Out(path)
+    print(f"Results are being saved to {path.name} as they come (no API key in it).")
     app = load_app()
     out(f"Job-Context Client {app.APP_VERSION} live tests - {time.strftime('%Y-%m-%d %H:%M')}")
     out(f"Python {sys.version.split()[0]}")
     out()
-    for name in names:
-        TESTS[name](app, out)
-        out()
-
-    path = HERE / time.strftime("test-results-%Y%m%d-%H%M.txt")
-    path.write_text("\n".join(out.lines) + "\n", encoding="utf-8")
+    try:
+        for name in names:
+            TESTS[name](app, out)
+            out()
+    except KeyboardInterrupt:
+        out("(stopped with Ctrl+C)")
     print(f"Saved to {path.name} (no API key in it).")
 
 
