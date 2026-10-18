@@ -50,7 +50,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.6.1"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -441,6 +441,20 @@ def _windows_proxy() -> str:
 _STREAM_REJECTED = [False]           # set if the gateway refuses "stream": true
 
 
+# A reply that stopped because it hit the reply limit (finish_reason "length"). Reasoning
+# models count their hidden thinking toward that limit, so this can happen even when the
+# visible reply is short. The note makes a cut-off reply obvious instead of silent.
+CUT_OFF_NOTE = ("\n\n[Reply cut off at the reply limit (Settings > Max reply tokens). "
+                "Reasoning models count their hidden thinking toward this limit.]")
+
+
+def _mark_if_cut_off(text: str, finish_reason) -> str:
+    if finish_reason == "length":
+        print("A reply was cut off at the reply limit (finish_reason=length).", flush=True)
+        return (text or "") + CUT_OFF_NOTE
+    return text
+
+
 def _read_stream(response) -> str:
     """
     Collect a streamed chat-completions reply (server-sent events: lines of
@@ -448,7 +462,7 @@ def _read_stream(response) -> str:
     A stream that stops without finishing is treated as a dropped connection, so
     the request is retried instead of returning a cut-off reply.
     """
-    parts, finished = [], False
+    parts, finished, reason = [], False, None
     for raw in response:
         line = raw.decode("utf-8", errors="replace").strip()
         if not line.startswith("data:"):
@@ -470,9 +484,10 @@ def _read_stream(response) -> str:
                 parts.append(piece)
             if choice.get("finish_reason"):
                 finished = True
+                reason = choice.get("finish_reason")
     if not finished:
         raise ConnectionResetError("The reply stream ended before the reply was complete")
-    return "".join(parts)
+    return _mark_if_cut_off("".join(parts), reason)
 
 
 API_ATTEMPTS = 4                     # first try + 3 retries
@@ -684,10 +699,10 @@ def _openai_complete(system: str, messages: list, s: dict, attempts: int | None 
 
     def plain():
         r = create()
-        return r.choices[0].message.content or ""
+        return _mark_if_cut_off(r.choices[0].message.content or "", r.choices[0].finish_reason)
 
     def streamed():
-        parts, finished, chunks = [], False, 0
+        parts, finished, chunks, reason = [], False, 0, None
         for chunk in create(stream=True):
             chunks += 1
             for choice in chunk.choices or []:
@@ -695,11 +710,12 @@ def _openai_complete(system: str, messages: list, s: dict, attempts: int | None 
                     parts.append(choice.delta.content)
                 if choice.finish_reason:
                     finished = True
+                    reason = choice.finish_reason
         if not chunks:
             raise _NoStream()
         if not finished:
             raise _StreamCutOff("the reply stream ended before the reply was complete")
-        return "".join(parts)
+        return _mark_if_cut_off("".join(parts), reason)
 
     if bool(s.get("stream", True)) and not _STREAM_REJECTED[0]:
         try:
@@ -847,7 +863,9 @@ def _genai_complete(system: str, messages: list, s: dict, attempts: int | None =
               flush=True)
         time.sleep(wait)
     try:
-        return data["choices"][0]["message"]["content"]           # <-- 3. reply text
+        choice = data["choices"][0]
+        return _mark_if_cut_off(choice["message"]["content"],          # <-- 3. reply text
+                                choice.get("finish_reason"))
     except (KeyError, IndexError, TypeError):
         raise LLMError("Unexpected response shape: " + json.dumps(data)[:500])
 

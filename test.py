@@ -268,13 +268,15 @@ def test_chat(app, out):
     out(f"  app's network route (Settings): {s.get('proxy_mode', 'env')}")
     out("  How the request travels (short reply, not streamed):")
     for label, direct in (("via system proxy", False), ("direct, bypassing system proxy", True)):
-        out(line(label, probe(url, {"model": model, "messages": short, "max_tokens": 50},
+        out(line(label, probe(url, {"model": model, "messages": short, "max_tokens": 1024},
                               headers, direct=direct)))
     # Same short question, different reply limits: if larger limits fail although the
     # reply is still "OK", the model is probably spending time before answering (e.g.
     # hidden reasoning), and non-streamed requests run into a time limit.
     out("  Reply limit (max_tokens), same short question, direct:")
-    for limit in (50, 500, 2000, 8000):
+    # Not below ~1,000: reasoning models spend part of the limit on hidden thinking, so a
+    # tiny limit can leave an empty reply even for "OK".
+    for limit in (1024, 2000, 8192):
         for stream in (False, True):
             body = {"model": model, "messages": short, "max_tokens": limit}
             if stream:
