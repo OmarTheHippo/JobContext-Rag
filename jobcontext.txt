@@ -47,7 +47,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.1.1"
+APP_VERSION = "3.1.2"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -195,6 +195,8 @@ DEFAULT_SETTINGS = {
     # are the most reliable through strict gateways and proxies.
     "brief_parallel": 1,
     "card_tokens": 12000,
+    # Ask the API to stream replies (see _genai_complete); keeps slow requests alive.
+    "stream": True,
 }
 
 # Automatic shares of the context window, used when the overrides are 0.
@@ -352,12 +354,22 @@ class LLMError(Exception):
     pass
 
 
-def complete(system: str, messages: list) -> str:
+class ConnectionFailed(LLMError):
+    """The connection kept being dropped or timing out (not an API error reply).
+    `durations` holds how long each attempt ran before it failed."""
+    def __init__(self, message: str, durations: list[float]):
+        super().__init__(message)
+        self.durations = durations
+
+
+def complete(system: str, messages: list, attempts: int | None = None) -> str:
+    """Send one request to the configured provider. `attempts` overrides how many
+    times a dropped connection is retried (used when narrowing down a failure)."""
     s = load_settings()
     fn = PROVIDERS.get(s["provider"])
     if not fn:
         raise LLMError(f"Unknown provider {s['provider']!r} - pick one in Settings.")
-    return fn(system, messages, s)
+    return fn(system, messages, s, attempts)
 
 
 def _model(s: dict) -> str:
@@ -369,6 +381,43 @@ def _chat_endpoint(s: dict) -> str:
     if not base:
         return ""
     return base if base.endswith(CHAT_PATH) else base + CHAT_PATH
+
+_STREAM_REJECTED = [False]           # set if the gateway refuses "stream": true
+
+
+def _read_stream(response) -> str:
+    """
+    Collect a streamed chat-completions reply (server-sent events: lines of
+    'data: {...}' with choices[0].delta.content, ending with 'data: [DONE]').
+    A stream that stops without finishing is treated as a dropped connection, so
+    the request is retried instead of returning a cut-off reply.
+    """
+    parts, finished = [], False
+    for raw in response:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if chunk == "[DONE]":
+            finished = True
+            break
+        try:
+            event = json.loads(chunk)
+        except ValueError:
+            continue
+        if event.get("error"):
+            raise LLMError("GenAI API error: " + json.dumps(event["error"])[:500])
+        for choice in event.get("choices") or []:
+            piece = ((choice.get("delta") or {}).get("content")
+                     or (choice.get("message") or {}).get("content"))
+            if piece:
+                parts.append(piece)
+            if choice.get("finish_reason"):
+                finished = True
+    if not finished:
+        raise ConnectionResetError("The reply stream ended before the reply was complete")
+    return "".join(parts)
+
 
 API_ATTEMPTS = 4                     # first try + 3 retries
 API_TIMEOUT_SECONDS = 300
@@ -386,7 +435,7 @@ def _retry_wait(attempt: int, retry_after: str | None = None) -> float:
     return 2 ** attempt + random.uniform(0, 1)
 
 
-def _genai_complete(system: str, messages: list, s: dict) -> str:
+def _genai_complete(system: str, messages: list, s: dict, attempts: int | None = None) -> str:
     """Calls the GenAI API using the common "chat completions" JSON shape:
         POST <base URL>/chat/completions   Authorization: Bearer <API key>
         {"model": ..., "messages": [{"role": "system", ...}, ...], "max_tokens": ...}
@@ -422,22 +471,50 @@ def _genai_complete(system: str, messages: list, s: dict) -> str:
         )
     headers = {"Content-Type": "application/json",
                "Authorization": f"Bearer {key}"}                  # <-- 2. auth header
-    payload = json.dumps(body).encode()
-    req = urllib.request.Request(url, data=payload, headers=headers)
+
+    # Streaming: the API sends the reply in pieces as it is written, so the
+    # connection is never silent. Proxies that cut silent connections (a common
+    # cause of WinError 10054 on slow requests such as briefs) then leave it alone.
+    # If the gateway rejects "stream", it is switched off for the rest of the session.
+    stream = bool(s.get("stream", True)) and not _STREAM_REJECTED[0]
+
+    def build(stream_on: bool):
+        data = json.dumps(dict(body, stream=True) if stream_on else body).encode()
+        return urllib.request.Request(url, data=data, headers=headers), data
+
+    req, payload = build(stream)
     size = f"request ~{len(payload) // 4:,} tokens"
 
     # Gateways and proxies sometimes drop a connection (WinError 10054 "forcibly
     # closed by the remote host"), time out, or answer 429/5xx when busy. Those are
     # retried with growing waits; anything else (bad key, bad request) fails at once.
-    for attempt in range(1, API_ATTEMPTS + 1):
+    # How long each attempt ran before failing is logged: an instant reset suggests
+    # a network filter rejecting the request; a long one suggests a timeout.
+    total = attempts or API_ATTEMPTS
+    durations: list[float] = []
+    attempt = 0
+    while attempt < total:
+        attempt += 1
         started = time.time()
         try:
             with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
-                data = json.load(r)
+                if "text/event-stream" in (r.headers.get("Content-Type") or ""):
+                    data = {"choices": [{"message": {"content": _read_stream(r)}}]}
+                else:
+                    data = json.load(r)          # gateway answered without streaming
             break
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:500]
-            if e.code not in RETRYABLE_HTTP_STATUS or attempt == API_ATTEMPTS:
+            if stream and e.code in (400, 404, 415, 422):
+                # Most likely the gateway doesn't accept "stream": send normally.
+                _STREAM_REJECTED[0] = True
+                stream = False
+                req, payload = build(False)
+                print(f"GenAI API rejected streaming (HTTP {e.code}); sending without "
+                      "streaming from now on.", flush=True)
+                attempt -= 1
+                continue
+            if e.code not in RETRYABLE_HTTP_STATUS or attempt == total:
                 raise LLMError(f"GenAI API error {e.code}: {detail}"
                                + (f" (after {attempt} attempts, {size})" if attempt > 1 else ""))
             wait = _retry_wait(attempt, e.headers.get("Retry-After"))
@@ -447,14 +524,16 @@ def _genai_complete(system: str, messages: list, s: dict) -> str:
             # ValueError covers a reply cut off mid-JSON.
             reason = getattr(e, "reason", None) or e
             problem = f"{type(reason).__name__}: {reason}"
-            if attempt == API_ATTEMPTS:
-                raise LLMError(
-                    f"Connection to the GenAI API failed after {attempt} attempts "
-                    f"({problem}; last attempt ran {time.time() - started:.0f}s; {size}). "
-                    "If this keeps happening, see Settings > Project briefs.")
+            durations.append(time.time() - started)
+            if attempt == total:
+                ran = ", ".join(f"{d:.1f}s" for d in durations)
+                raise ConnectionFailed(
+                    f"Connection to the GenAI API failed {attempt} times ({problem}; "
+                    f"{size}; attempts ran {ran} before failing).", durations)
             wait = _retry_wait(attempt)
-        print(f"GenAI request failed ({problem}; {size}); retry {attempt + 1} of "
-              f"{API_ATTEMPTS} in {wait:.0f}s", flush=True)
+        print(f"GenAI request failed ({problem}; {size}; failed after "
+              f"{time.time() - started:.1f}s); retry {attempt + 1} of {total} in {wait:.0f}s",
+              flush=True)
         time.sleep(wait)
     try:
         return data["choices"][0]["message"]["content"]           # <-- 3. reply text
@@ -462,7 +541,7 @@ def _genai_complete(system: str, messages: list, s: dict) -> str:
         raise LLMError("Unexpected response shape: " + json.dumps(data)[:500])
 
 
-def _mock_complete(system: str, messages: list, s: dict) -> str:
+def _mock_complete(system: str, messages: list, s: dict, attempts: int | None = None) -> str:
     last = messages[-1]["content"] if messages else ""
     if "<current_layer>" in last:
         current = last.split("<current_layer>", 1)[1].split("</current_layer>", 1)[0].strip()
@@ -1069,18 +1148,41 @@ Organisation guidance:
 <<GUIDANCE>>
 
 Write Markdown with exactly these sections:
-## Overview
+<<SECTIONS>>"""
+
+# The brief's sections, in order. Normally written in one request; if that request
+# keeps being cut off (a slow reply through a proxy that drops silent connections),
+# it is written in these groups instead and joined.
+BRIEF_SECTION_GROUPS = [
+    """## Overview
 ## Work classification and funding
 ## Cost
-## Scope (facilities, systems, equipment)
-## Evidentiary matter
+## Scope (facilities, systems, equipment)""",
+    """## Evidentiary matter
 A table with columns Item | Found in | Notes, one row per EM item in the guidance.
 "Found in" is the file name(s), or "not found in the project files".
 ## Schedule and milestones
-## Conflicts between documents
-## Gaps (unreadable or partly read files, open questions)
+## Conflicts between documents""",
+    """## Gaps (unreadable or partly read files, open questions)
 ## Document inventory
-A table with columns File | Type | Summary, one row per file."""
+A table with columns File | Type | Summary, one row per file.""",
+]
+
+
+def write_brief(guidance: str, cards_request: str) -> str:
+    """The brief in one request, or in section groups if that keeps failing."""
+    base = BRIEF_SYSTEM.replace("<<GUIDANCE>>", guidance)
+    messages = [{"role": "user", "content": cards_request}]
+    try:
+        return complete(base.replace("<<SECTIONS>>", "\n".join(BRIEF_SECTION_GROUPS)), messages)
+    except ConnectionFailed:
+        print("Brief request keeps failing; writing it in smaller section groups.", flush=True)
+        return "\n\n".join(
+            complete(base.replace("<<SECTIONS>>", group)
+                     + "\nWrite only these sections; other sections are written separately.",
+                     messages).strip()
+            for group in BRIEF_SECTION_GROUPS)
+
 
 BRIEF_JOBS: dict[str, dict] = {}
 BRIEF_LOCK = threading.Lock()
@@ -1117,10 +1219,16 @@ def brief_section(layer: dict) -> str:
             f"files on {when}; a summary, not a source)\n\n{text}")
 
 
-def _card_for_text(file_name: str, text: str, guidance: str) -> dict:
-    request = f"File name: {file_name}\n\n--- DOCUMENT TEXT ---\n{text}"
+# When a card request keeps failing at the connection level, the text is split in
+# half and each half retried, down to pieces of about this size.
+MIN_SPLIT_CHARS = 1500
+SPLIT_ATTEMPTS = 2          # tries per piece while narrowing down (first try uses all)
+
+
+def _card_for_text(label: str, text: str, guidance: str, attempts: int | None = None) -> dict:
+    request = f"File name: {label}\n\n--- DOCUMENT TEXT ---\n{text}"
     reply = complete(CARD_SYSTEM.replace("<<GUIDANCE>>", guidance),
-                     [{"role": "user", "content": request}])
+                     [{"role": "user", "content": request}], attempts=attempts)
     card = _planner_json(reply)
     if not card:
         # Unreadable reply: keep what the model said rather than lose the file.
@@ -1129,10 +1237,59 @@ def _card_for_text(file_name: str, text: str, guidance: str) -> dict:
     return card
 
 
+def _split_point(text: str) -> int:
+    """Near the middle, preferring a paragraph break, then a line break, then a space."""
+    middle = len(text) // 2
+    window = text[middle - middle // 2: middle + middle // 2]
+    for mark in ("\n\n", "\n", " "):
+        at = window.rfind(mark)
+        if at != -1:
+            return middle - middle // 2 + at + len(mark)
+    return middle
+
+
+def _cards_for_piece(name: str, text: str, start: int, guidance: str,
+                     blocked: list, attempts: int | None) -> list[dict]:
+    """
+    Card(s) for one piece of a file. If the connection keeps being dropped, split
+    the piece in half and try each half. Size- or time-related failures then
+    succeed on smaller pieces; a content filter keeps rejecting only the piece that
+    contains what it objects to, which ends up in `blocked`.
+    """
+    label = f"{name} (characters {start:,}-{start + len(text):,})"
+    try:
+        return [_card_for_text(label, text, guidance, attempts)]
+    except ConnectionFailed as exc:
+        if len(text) <= MIN_SPLIT_CHARS:
+            blocked.append({"start": start, "end": start + len(text),
+                            "preview": " ".join(text.split())[:120],
+                            "durations": [round(d, 1) for d in exc.durations]})
+            return []
+        cut = _split_point(text)
+        print(f"Card request for {label} keeps failing; trying it in two halves.", flush=True)
+        return (_cards_for_piece(name, text[:cut], start, guidance, blocked, SPLIT_ATTEMPTS)
+                + _cards_for_piece(name, text[cut:], start + cut, guidance, blocked, SPLIT_ATTEMPTS))
+
+
+def _blocked_note(blocked: list, total_chars: int) -> str:
+    durations = [d for b in blocked for d in b["durations"]]
+    average = sum(durations) / len(durations) if durations else 0
+    why = ("each attempt was cut off almost immediately, which points to a network "
+           "filter rejecting that text" if average < 5 else
+           f"each attempt ran about {average:.0f}s before being cut off, which points "
+           "to a timeout")
+    spans = "; ".join(f"characters {b['start']:,}-{b['end']:,} (starting \"{b['preview'][:60]}\")"
+                      for b in blocked[:5])
+    sent = total_chars - sum(b["end"] - b["start"] for b in blocked)
+    return (f"{sent:,} of {total_chars:,} characters were summarised. The connection was "
+            f"dropped every time these parts were sent: {spans}. In those attempts {why}.")
+
+
 def make_file_card(source: dict, guidance: str) -> dict:
     """
-    One file card. Files longer than one request can hold are read in parts and the
-    part cards are merged locally (lists combined, first part's type/title kept).
+    One file card. Files longer than one request can hold are read in parts, and a
+    part whose request keeps failing is narrowed down (see _cards_for_piece). Part
+    cards are merged locally (lists combined, first part's type/title kept).
     """
     # Never more than the context window allows, and never more than the Settings cap.
     limits = budgets()
@@ -1140,12 +1297,17 @@ def make_file_card(source: dict, guidance: str) -> dict:
     wanted = int(load_settings().get("card_tokens") or 12000) * 4
     part_chars = max(8_000, min(fits, wanted))
     text = source["text"]
-    parts = [text[i:i + part_chars] for i in range(0, len(text), part_chars)] or [""]
+    starts = list(range(0, len(text), part_chars)) or [0]
 
-    cards = []
-    for number, part in enumerate(parts, start=1):
-        label = source["file_name"] + (f" (part {number} of {len(parts)})" if len(parts) > 1 else "")
-        cards.append(_card_for_text(label, part, guidance))
+    cards, blocked = [], []
+    for start in starts:
+        cards += _cards_for_piece(source["file_name"], text[start:start + part_chars],
+                                  start, guidance, blocked, None)
+
+    if not cards:
+        raise LLMError("No part of this file could be sent. " + _blocked_note(blocked, len(text))
+                       + " Since even short pieces failed, the cause is probably not this "
+                       "file's content but the connection or the request format.")
 
     card = dict(cards[0])
     if len(cards) > 1:
@@ -1156,8 +1318,12 @@ def make_file_card(source: dict, guidance: str) -> dict:
                 merged += [v for v in values if v not in merged]
             card[key] = merged
         card["summary"] = " ".join(str(c.get("summary") or "") for c in cards).strip()
-        card["notes"] = (f"Read in {len(cards)} parts because of its length. "
+        card["notes"] = (f"Read in {len(cards)} parts. "
                          + " ".join(str(c.get("notes") or "") for c in cards)).strip()
+    if blocked:
+        card["notes"] = (str(card.get("notes") or "") + " " + _blocked_note(blocked, len(text))).strip()
+        card["extraction_quality"] = "partial"
+        card["blocked"] = blocked
     return card
 
 
@@ -1228,8 +1394,7 @@ def _brief_worker(layer_id: str) -> None:
         failed_note = ("\n\nThese files could not be summarised because of an error "
                        "(list them under Gaps as not yet reviewed):\n- "
                        + "\n- ".join(failed)) if failed else ""
-        text = complete(BRIEF_SYSTEM.replace("<<GUIDANCE>>", guidance),
-                        [{"role": "user", "content": f"File cards:\n{cards_text}{failed_note}"}])
+        text = write_brief(guidance, f"File cards:\n{cards_text}{failed_note}")
 
         layer = load("projects", layer_id)            # fresh copy: don't undo other edits
         layer["brief"] = {
@@ -1280,6 +1445,8 @@ def brief_status(layer_id: str) -> dict:
                 "summary": card.get("summary", ""),
                 "quality": card.get("extraction_quality", ""),
                 "error": record.get("error", ""),
+                # Set when parts of the file kept being rejected (see make_file_card).
+                "blocked_note": card.get("notes", "") if card.get("blocked") else "",
             })
 
     with BRIEF_LOCK:
@@ -1359,6 +1526,8 @@ def get_settings(body, query):
             "history_budget": s.get("history_budget") or 0,
             "brief_guidance": s.get("brief_guidance", DEFAULT_BRIEF_GUIDANCE),
             "brief_parallel": s.get("brief_parallel") or 1,
+            "stream": s.get("stream", True),
+            "stream_rejected": _STREAM_REJECTED[0],
             "card_tokens": s.get("card_tokens") or 12000,
             "default_brief_guidance": DEFAULT_BRIEF_GUIDANCE,
             "budgets": budgets(s)}
@@ -1393,6 +1562,8 @@ def set_settings(body, query):
             raise HttpError(400, f"{label} must be a whole number.")
     if "brief_guidance" in body:
         s["brief_guidance"] = str(body["brief_guidance"]).strip()
+    if "stream" in body:
+        s["stream"] = bool(body["stream"])
     if body.get("clear_key"):
         s["api_key_enc"] = ""
     elif body.get("api_key"):                     # blank means "keep the saved key"
@@ -2419,6 +2590,9 @@ PAGE_HTML = r"""<!doctype html>
     <div class="small muted" id="set-key-status"></div>
     <label class="field">Max reply tokens
       <input id="set-max" type="number" min="256" step="256"></label>
+    <label><input id="set-stream" type="checkbox"> Stream replies (recommended: keeps slow
+      requests such as briefs from being cut off by proxies)</label>
+    <div class="small muted" id="set-stream-note"></div>
 
     <h3>Token limits</h3>
     <label class="field">Model context window (tokens)
@@ -2639,6 +2813,10 @@ async function openSettings() {
   $("#set-history").value = s.history_budget || "";
   $("#set-guidance").value = s.brief_guidance || "";
   $("#set-brief-parallel").value = s.brief_parallel || 1;
+  $("#set-stream").checked = s.stream !== false;
+  $("#set-stream-note").textContent = s.stream_rejected
+    ? "Your gateway rejected streaming this session, so replies are being sent normally."
+    : "";
   $("#set-card-tokens").value = s.card_tokens || 12000;
   $("#btn-guidance-reset").onclick = () => { $("#set-guidance").value = s.default_brief_guidance; };
   $("#set-key").value = "";
@@ -2658,6 +2836,7 @@ async function saveSettings(extra = {}) {
     context_window: $("#set-window").value, doc_budget: $("#set-docs").value,
     history_budget: $("#set-history").value, brief_guidance: $("#set-guidance").value,
     brief_parallel: $("#set-brief-parallel").value, card_tokens: $("#set-card-tokens").value,
+    stream: $("#set-stream").checked,
     ...extra };
   const key = $("#set-key").value.trim();
   if (key) body.api_key = key;
@@ -3611,6 +3790,7 @@ async function loadBrief(layerId) {
               ${(c.em || []).length ? ` · EM: ${esc(c.em.join(", "))}` : ""}
               ${c.quality && c.quality !== "good" ? ` · extraction: ${esc(c.quality)}` : ""}
               ${c.error ? `<div class="source-location">Error: ${esc(c.error)}</div>` : ""}
+              ${c.blocked_note ? `<div class="source-location"><b>Partly sent:</b> ${esc(c.blocked_note)}</div>` : ""}
               <div class="source-location">${esc(c.summary || "")}</div>
             </li>`).join("")}</ul></details>`
       : "");
