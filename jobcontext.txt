@@ -50,7 +50,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.5.1"
+APP_VERSION = "3.6.0"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -210,6 +210,8 @@ DEFAULT_SETTINGS = {
     "proxy_mode": "env",
     # Which HTTP client sends API requests; see _use_openai().
     "api_client": "auto",
+    # How the reply limit is sent; see _with_reply_limit().
+    "limit_param": "auto",
     # How instructions and history are sent; see _wire_messages(). Combined is the
     # default because some gateways forward only the last user message (measured live:
     # a system message and earlier turns were both ignored).
@@ -509,6 +511,65 @@ def _wire_messages(system: str, messages: list, s: dict) -> list:
     return [{"role": "system", "content": system}] + list(messages)
 
 
+# ----- Reply limit ------------------------------------------------------------------------
+# How the reply limit (Settings > Max reply tokens) is sent. Models differ: some accept
+# "max_tokens", newer ones want "max_completion_tokens", some reject values above their
+# own maximum, and some reject the parameter outright (measured live: the "-withtools"
+# model returned HTTP 400 for max_tokens=16000 and worked without it). "auto" tries
+# max_tokens, then max_completion_tokens, then no limit, honouring a maximum named in
+# the error, and remembers what worked for the session.
+LIMIT_PARAMS = {
+    "auto": "Automatic (find what the model accepts)",
+    "max_tokens": "Send as max_tokens",
+    "max_completion_tokens": "Send as max_completion_tokens",
+    "none": "Don't send a reply limit (the model's own default)",
+}
+_LIMIT_LEARNED: dict = {}            # {"param": ..., "cap": int | None} once auto finds it
+
+
+def _limit_kwargs(param: str, value: int) -> dict:
+    return {} if param == "none" else {param: value}
+
+
+def _cap_from_error(text: str) -> int | None:
+    """A maximum stated in an error, e.g. "must be less than or equal to 8192"."""
+    match = re.search(r"(?:less than or equal to|at most|maximum(?: value| allowed)?(?: is| of)?"
+                      r"|must be <=|<=|up to)\s*([0-9][0-9,]{2,})", text, re.I)
+    return int(match.group(1).replace(",", "")) if match else None
+
+
+def _with_reply_limit(create, max_tokens: int, s: dict):
+    """Call create(**limit) with the reply limit sent the way the model accepts.
+    Only the openai-library path uses the automatic detection."""
+    choice = s.get("limit_param", "auto")
+    if choice != "auto":
+        return create(**_limit_kwargs(choice, max_tokens))
+    if _LIMIT_LEARNED:
+        cap = _LIMIT_LEARNED.get("cap")
+        return create(**_limit_kwargs(_LIMIT_LEARNED["param"],
+                                      min(max_tokens, cap) if cap else max_tokens))
+    first_error = None
+    for param in ("max_tokens", "max_completion_tokens", "none"):
+        tries = [max_tokens]
+        while tries:
+            value = tries.pop(0)
+            try:
+                result = create(**_limit_kwargs(param, value))
+            except openai.BadRequestError as e:
+                first_error = first_error or e
+                cap = _cap_from_error(str(e)) if param != "none" else None
+                if cap and cap < value and cap not in tries:
+                    tries.append(cap)            # retry this parameter at the stated maximum
+                continue
+            _LIMIT_LEARNED.update(param=param, cap=value if value < max_tokens else None)
+            if (param, value) != ("max_tokens", max_tokens):
+                how = "no reply limit" if param == "none" else f"{param}={value:,}"
+                print(f"Model rejected max_tokens={max_tokens:,}; using {how} from now on.",
+                      flush=True)
+            return result
+    raise first_error
+
+
 # ----- OpenAI library client ----------------------------------------------------------
 # On some agency networks the gateway (or something in front of it) stalls requests
 # made with Python's built-in urllib until they are dropped (WinError 10054 after
@@ -615,14 +676,19 @@ def _openai_complete(system: str, messages: list, s: dict, attempts: int | None 
     max_tokens = int(s.get("max_tokens") or 4000)
     size = f"request ~{len(json.dumps(msgs)) // 4:,} tokens"
 
+    def create(**extra):
+        return _with_reply_limit(
+            lambda **limit: client.chat.completions.create(model=model, messages=msgs,
+                                                           **limit, **extra),
+            max_tokens, s)
+
     def plain():
-        r = client.chat.completions.create(model=model, messages=msgs, max_tokens=max_tokens)
+        r = create()
         return r.choices[0].message.content or ""
 
     def streamed():
         parts, finished, chunks = [], False, 0
-        for chunk in client.chat.completions.create(model=model, messages=msgs,
-                                                    max_tokens=max_tokens, stream=True):
+        for chunk in create(stream=True):
             chunks += 1
             for choice in chunk.choices or []:
                 if choice.delta and choice.delta.content:
@@ -645,7 +711,9 @@ def _openai_complete(system: str, messages: list, s: dict, attempts: int | None 
             print("GenAI API doesn't stream; sending without streaming from now on.",
                   flush=True)
         except LLMError as e:
-            if isinstance(e, ConnectionFailed) or not any(
+            # Only an error that mentions streaming means the gateway refuses it; any
+            # other 400 (e.g. a parameter the model rejects) must not switch it off.
+            if isinstance(e, ConnectionFailed) or "stream" not in str(e).lower() or not any(
                     f"API error {code}" in str(e) for code in (400, 404, 415, 422)):
                 raise
             _STREAM_REJECTED[0] = True
@@ -691,8 +759,15 @@ def _genai_complete(system: str, messages: list, s: dict, attempts: int | None =
     body = {                                                       # <-- 1. request body
         "model": _model(s),
         "messages": _wire_messages(system, messages, s),
-        "max_tokens": int(s.get("max_tokens") or 4000),
     }
+    # Reply limit as chosen in Settings, or as learned by the openai-library path.
+    limit_param = s.get("limit_param", "auto")
+    if limit_param == "auto":
+        limit_param = _LIMIT_LEARNED.get("param", "max_tokens")
+    limit_value = int(s.get("max_tokens") or 4000)
+    if _LIMIT_LEARNED.get("cap"):
+        limit_value = min(limit_value, _LIMIT_LEARNED["cap"])
+    body.update(_limit_kwargs(limit_param, limit_value))
     if os.environ.get("JOBCTX_DEBUG_PROMPTS") == "1":
         safe_debug = {
             "model": body.get("model"),
@@ -741,7 +816,7 @@ def _genai_complete(system: str, messages: list, s: dict, attempts: int | None =
             break
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:500]
-            if stream and e.code in (400, 404, 415, 422):
+            if stream and e.code in (400, 404, 415, 422) and "stream" in detail.lower():
                 # Most likely the gateway doesn't accept "stream": send normally.
                 _STREAM_REJECTED[0] = True
                 stream = False
@@ -2007,6 +2082,9 @@ def get_settings(body, query):
             "proxy_mode": s.get("proxy_mode", "env"),
             "api_client": s.get("api_client", "auto"),
             "message_format": s.get("message_format", "combined"),
+            "limit_param": s.get("limit_param", "auto"),
+            "limit_params": LIMIT_PARAMS,
+            "limit_learned": dict(_LIMIT_LEARNED),
             "message_formats": MESSAGE_FORMATS,
             "api_clients": API_CLIENTS,
             "openai_installed": (openai.__version__ if openai else ""),
@@ -2056,6 +2134,9 @@ def set_settings(body, query):
         s["api_client"] = body["api_client"]
     if body.get("message_format") in MESSAGE_FORMATS:
         s["message_format"] = body["message_format"]
+    if body.get("limit_param") in LIMIT_PARAMS:
+        s["limit_param"] = body["limit_param"]
+    _LIMIT_LEARNED.clear()              # model or settings may have changed: detect again
     _OPENAI_CLIENTS.clear()            # rebuilt with the new settings on next use
     if body.get("embedding_mode") in ("local", "api"):
         s["embedding_mode"] = body["embedding_mode"]
@@ -3173,6 +3254,9 @@ PAGE_HTML = r"""<!doctype html>
     <div class="small muted" id="set-key-status"></div>
     <label class="field">Max reply tokens
       <input id="set-max" type="number" min="256" step="256"></label>
+    <label class="field">How the reply limit is sent
+      <select id="set-limit-param"></select></label>
+    <div class="small muted" id="set-limit-note"></div>
     <label class="field">Message format
       <select id="set-format"></select></label>
     <div class="small muted">Native only helps if your gateway forwards system messages
@@ -3440,6 +3524,14 @@ async function openSettings() {
   $("#set-format").innerHTML = Object.entries(s.message_formats || {})
     .map(([value, label]) => `<option value="${value}">${esc(label)}</option>`).join("");
   $("#set-format").value = s.message_format || "combined";
+  $("#set-limit-param").innerHTML = Object.entries(s.limit_params || {})
+    .map(([value, label]) => `<option value="${value}">${esc(label)}</option>`).join("");
+  $("#set-limit-param").value = s.limit_param || "auto";
+  const learned = s.limit_learned || {};
+  $("#set-limit-note").textContent = learned.param
+    ? `Found this session: ${learned.param === "none" ? "no reply limit" : learned.param}`
+      + (learned.cap ? ` (capped at ${learned.cap.toLocaleString()})` : "") + "."
+    : "";
   $("#set-client-note").textContent = s.openai_installed
     ? `openai library ${s.openai_installed} is installed.`
     : "The openai library is not installed (py -m pip install openai); the built-in client is used.";
@@ -3471,6 +3563,7 @@ async function saveSettings(extra = {}) {
     chunk_chars: $("#set-chunk").value,
     stream: $("#set-stream").checked, proxy_mode: $("#set-proxy").value,
     api_client: $("#set-client").value, message_format: $("#set-format").value,
+    limit_param: $("#set-limit-param").value,
     ...extra };
   const key = $("#set-key").value.trim();
   if (key) body.api_key = key;

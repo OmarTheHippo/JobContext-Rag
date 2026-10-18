@@ -500,7 +500,7 @@ def test_replica(app, out):
                 f"reply ends: {tail!r}")
             return ok
         except Exception as e:                               # noqa: BLE001
-            out(f"  FAIL  {label:<52} after {time.time() - started:.1f}s - {str(e)[:140]}")
+            out(f"  FAIL  {label:<52} after {time.time() - started:.1f}s - {str(e)[:400]}")
             return False
 
     sys_msg = lambda text: [{"role": "system", "content": text}]
@@ -509,7 +509,14 @@ def test_replica(app, out):
     b = check("B. same, with the app's reply limit",
               lambda: direct(sys_msg(codeword_system) + photosynthesis, max_tokens=max_tokens),
               "CODEWORD 42")
+    check("B2. same, limit sent as max_completion_tokens",
+          lambda: direct(sys_msg(codeword_system) + photosynthesis,
+                         max_completion_tokens=max_tokens), "CODEWORD 42")
+    check("B3. same, max_tokens=8,192",
+          lambda: direct(sys_msg(codeword_system) + photosynthesis, max_tokens=8192),
+          "CODEWORD 42")
     native = dict(s, message_format="native", stream=False)
+    app._LIMIT_LEARNED.clear()
     c = check("C. same, through the app's own code (Native)",
               lambda: app.PROVIDERS["genai"](codeword_system, photosynthesis, native, 1),
               "CODEWORD 42")
@@ -518,17 +525,27 @@ def test_replica(app, out):
     e = check("E. earlier turns, direct, no reply limit",
               lambda: direct(sys_msg("Answer briefly.") + turns), "HYDRANT")
 
+    learned = app._LIMIT_LEARNED
+    if learned:
+        out(f"  (the app found the reply limit works as: "
+            f"{'no limit' if learned['param'] == 'none' else learned['param']}"
+            f"{', capped at ' + format(learned['cap'], ',') if learned.get('cap') else ''})")
     out("")
     out("  The exact request body the app sends for C (no key):")
-    body = {"model": model, "messages": app._wire_messages(codeword_system, photosynthesis, native),
-            "max_tokens": max_tokens}
+    body = {"model": model, "messages": app._wire_messages(codeword_system, photosynthesis, native)}
+    body.update(app._limit_kwargs(learned.get("param", "max_tokens"),
+                                  min(max_tokens, learned.get("cap") or max_tokens)))
     for text_line in json.dumps(body, indent=2).splitlines():
         out("    " + text_line)
 
     out("")
     out("  What this suggests:")
-    if a and not b:
-        out("  - The reply limit (max_tokens) breaks it: Claude can stop sending it.")
+    if a and not b and c:
+        out("  - The model rejects max_tokens as the app first sent it; the app now detects")
+        out("    what the model accepts (see the line above the request body) and C works.")
+    elif a and not b:
+        out("  - The reply limit (max_tokens) breaks it, and the app's detection didn't fix C:")
+        out("    send this file to Claude.")
     elif a and b and not c:
         out("  - Direct works but the app's code doesn't: compare the body above with your")
         out("    script's request and send this file to Claude.")

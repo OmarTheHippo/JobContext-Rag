@@ -52,6 +52,9 @@ first time a folder is indexed. With an API embedding model nothing is downloade
   model, prose passages default to 3,000 characters; spreadsheet and CSV passages stay
   around 1,000 so single rows aren't buried. Texts are sent 20 per request. Changing
   the model or passage size requires re-indexing; the editor flags affected folders.
+- **Reply limit.** Models differ in how they accept a reply limit (`max_tokens`,
+  `max_completion_tokens`, a lower maximum, or none at all). On Automatic, the app
+  finds what the model accepts on the first request and reuses it; Settings can fix it.
 - **Message format.** Combined (default): layer prompts and the earlier conversation go
   into one user message, which works with gateways that forward only the last user
   message. Native: a real system message and real conversation turns, for gateways
@@ -92,6 +95,7 @@ search index, settings) and is excluded from git.
 Settings, to pin down connection problems:
 
 ```
+py test.py replica
 py test.py system
 py test.py openai
 py test.py embeddings
