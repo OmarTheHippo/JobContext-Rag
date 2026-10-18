@@ -50,7 +50,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.0"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -208,6 +208,8 @@ DEFAULT_SETTINGS = {
     "stream": True,
     # How requests reach the API: "env" (default), "system" or "none"; see _open().
     "proxy_mode": "env",
+    # Which HTTP client sends API requests; see _use_openai().
+    "api_client": "auto",
 }
 
 # Automatic shares of the context window, used when the overrides are 0.
@@ -484,6 +486,167 @@ def _retry_wait(attempt: int, retry_after: str | None = None) -> float:
     return 2 ** attempt + random.uniform(0, 1)
 
 
+# ----- OpenAI library client ----------------------------------------------------------
+# On some agency networks the gateway (or something in front of it) stalls requests
+# made with Python's built-in urllib until they are dropped (WinError 10054 after
+# ~90 s), while the same requests through the openai library work - measured live
+# with test.py. So API calls go through the openai library when it is installed
+# (Settings > API client); the urllib code below remains as a fallback.
+
+try:
+    import openai
+except ImportError:                  # optional: the built-in client is used instead
+    openai = None
+
+API_CLIENTS = {
+    "auto": "openai library if installed, otherwise built-in (recommended)",
+    "openai": "openai library",
+    "builtin": "Built-in (Python urllib)",
+}
+_OPENAI_CLIENTS: dict[tuple, object] = {}
+
+
+def _use_openai(s: dict) -> bool:
+    choice = s.get("api_client", "auto")
+    if choice == "builtin":
+        return False
+    if openai is None:
+        if choice == "openai":
+            raise LLMError("Settings > API client is set to the openai library, but it "
+                           "isn't installed: py -m pip install openai")
+        return False
+    return True
+
+
+def _openai_client(s: dict):
+    """One cached client per base URL, key and network route."""
+    base = (s.get("base_url") or "").strip().rstrip("/")
+    if base.endswith(CHAT_PATH):
+        base = base[: -len(CHAT_PATH)]
+    key, route = get_api_key(), s.get("proxy_mode", "env")
+    if not base:
+        raise LLMError("Set the Base URL in Settings.")
+    if not key:
+        raise LLMError("No API key - add it in Settings.")
+    cache_key = (base, hashlib.sha256(key.encode()).hexdigest(), route)
+    if cache_key not in _OPENAI_CLIENTS:
+        http_client = None                               # "env": library default
+        if route == "none":
+            http_client = openai.DefaultHttpxClient(trust_env=False)
+        elif route == "system":
+            proxy = _proxies("system")
+            proxy = proxy.get("https") or proxy.get("http")
+            http_client = (openai.DefaultHttpxClient(proxy=proxy) if proxy
+                           else openai.DefaultHttpxClient(trust_env=False))
+        _OPENAI_CLIENTS[cache_key] = openai.OpenAI(
+            base_url=base, api_key=key, timeout=API_TIMEOUT_SECONDS,
+            max_retries=0,                               # the app retries itself
+            http_client=http_client)
+    return _OPENAI_CLIENTS[cache_key]
+
+
+class _StreamCutOff(Exception):
+    """A streamed reply stopped before it finished."""
+
+
+class _NoStream(Exception):
+    """A streamed request produced nothing at all: the gateway doesn't stream."""
+
+
+def _openai_call(label: str, size: str, attempts: int | None, call):
+    """Run call() with the app's retry rules; connection problems -> ConnectionFailed."""
+    total = attempts or API_ATTEMPTS
+    durations: list[float] = []
+    attempt = 0
+    while attempt < total:
+        attempt += 1
+        started = time.time()
+        try:
+            return call()
+        except (openai.APIConnectionError, _StreamCutOff) as e:   # includes timeouts
+            problem = f"{type(e).__name__}: {e}"
+            durations.append(time.time() - started)
+            if attempt == total:
+                ran = ", ".join(f"{d:.1f}s" for d in durations)
+                raise ConnectionFailed(f"{label} failed {attempt} times ({problem}; {size}; "
+                                       f"attempts ran {ran} before failing).", durations)
+            wait = _retry_wait(attempt)
+        except openai.APIStatusError as e:
+            if e.status_code not in RETRYABLE_HTTP_STATUS or attempt == total:
+                raise LLMError(f"{label}: API error {e.status_code}: {str(e)[:500]} ({size})")
+            problem = f"HTTP {e.status_code}"
+            wait = _retry_wait(attempt, e.response.headers.get("retry-after"))
+        print(f"{label} failed ({problem}; {size}; failed after {time.time() - started:.1f}s); "
+              f"retry {attempt + 1} of {total} in {wait:.0f}s", flush=True)
+        time.sleep(wait)
+
+
+def _openai_complete(system: str, messages: list, s: dict, attempts: int | None = None) -> str:
+    """Chat through the openai library: same request content and streaming rules as
+    the built-in client below."""
+    client = _openai_client(s)
+    model = _model(s)
+    if not model:
+        raise LLMError("Set the Model in Settings.")
+    msgs = messages[:-1] + [{"role": "user", "content": "<standing_instructions>\n" + system
+                             + "\n</standing_instructions>\n\n" + messages[-1]["content"]}]
+    max_tokens = int(s.get("max_tokens") or 4000)
+    size = f"request ~{len(json.dumps(msgs)) // 4:,} tokens"
+
+    def plain():
+        r = client.chat.completions.create(model=model, messages=msgs, max_tokens=max_tokens)
+        return r.choices[0].message.content or ""
+
+    def streamed():
+        parts, finished, chunks = [], False, 0
+        for chunk in client.chat.completions.create(model=model, messages=msgs,
+                                                    max_tokens=max_tokens, stream=True):
+            chunks += 1
+            for choice in chunk.choices or []:
+                if choice.delta and choice.delta.content:
+                    parts.append(choice.delta.content)
+                if choice.finish_reason:
+                    finished = True
+        if not chunks:
+            raise _NoStream()
+        if not finished:
+            raise _StreamCutOff("the reply stream ended before the reply was complete")
+        return "".join(parts)
+
+    if bool(s.get("stream", True)) and not _STREAM_REJECTED[0]:
+        try:
+            return _openai_call("GenAI request", size, attempts, streamed)
+        except _NoStream:
+            # The gateway answered a streamed request with an ordinary reply (which
+            # the library reads as an empty stream): use ordinary replies from now on.
+            _STREAM_REJECTED[0] = True
+            print("GenAI API doesn't stream; sending without streaming from now on.",
+                  flush=True)
+        except LLMError as e:
+            if isinstance(e, ConnectionFailed) or not any(
+                    f"API error {code}" in str(e) for code in (400, 404, 415, 422)):
+                raise
+            _STREAM_REJECTED[0] = True
+            print("GenAI API rejected streaming; sending without streaming from now on.",
+                  flush=True)
+    return _openai_call("GenAI request", size, attempts, plain)
+
+
+def _openai_embed(texts: list[str], s: dict, attempts: int | None = None) -> list[list[float]]:
+    """Embeddings through the openai library (it requests compact base64 itself)."""
+    client = _openai_client(s)
+    model = (s.get("embedding_model") or "").strip()
+    if not model:
+        raise LLMError("Set the embedding model in Settings > Document search.")
+    size = f"{len(texts)} texts, ~{sum(len(t) for t in texts) // 4:,} tokens"
+    result = _openai_call("Embeddings request", size, attempts,
+                          lambda: client.embeddings.create(model=model, input=texts))
+    vectors = [item.embedding for item in sorted(result.data, key=lambda d: d.index)]
+    if len(vectors) != len(texts):
+        raise LLMError(f"Embeddings API returned {len(vectors)} vectors for {len(texts)} texts.")
+    return vectors
+
+
 def _genai_complete(system: str, messages: list, s: dict, attempts: int | None = None) -> str:
     """Calls the GenAI API using the common "chat completions" JSON shape:
         POST <base URL>/chat/completions   Authorization: Bearer <API key>
@@ -494,6 +657,8 @@ def _genai_complete(system: str, messages: list, s: dict, attempts: int | None =
     lines. Proxies in the HTTPS_PROXY environment variable are used automatically, and
     on Windows the system certificate store is trusted.
     """
+    if _use_openai(s):
+        return _openai_complete(system, messages, s, attempts)
     url, key = _chat_endpoint(s), get_api_key()
     if not url:
         raise LLMError("Set the Base URL in Settings.")
@@ -647,6 +812,12 @@ def _read_reply(r) -> tuple[bytes, dict]:
 
 def _genai_embed(texts: list[str], s: dict, attempts: int | None = None) -> list[list[float]]:
     """One embeddings request (up to EMBED_BATCH texts), with the same retries as chat."""
+    if _use_openai(s):
+        out = []
+        for v in _openai_embed(texts, s, attempts):
+            norm = math.sqrt(sum(x * x for x in v)) or 1.0
+            out.append([x / norm for x in v])
+        return out
     url, key, model = _embeddings_endpoint(s), get_api_key(), (s.get("embedding_model") or "").strip()
     if not url:
         raise LLMError("Set the Base URL in Settings.")
@@ -1788,6 +1959,9 @@ def get_settings(body, query):
             "chunk_chars_effective": rag.CHUNK_CHARS,
             "stream": s.get("stream", True),
             "proxy_mode": s.get("proxy_mode", "env"),
+            "api_client": s.get("api_client", "auto"),
+            "api_clients": API_CLIENTS,
+            "openai_installed": (openai.__version__ if openai else ""),
             "proxy_modes": PROXY_MODES,
             "windows_proxy": _windows_proxy(),
             "stream_rejected": _STREAM_REJECTED[0],
@@ -1830,6 +2004,9 @@ def set_settings(body, query):
         s["stream"] = bool(body["stream"])
     if body.get("proxy_mode") in PROXY_MODES:
         s["proxy_mode"] = body["proxy_mode"]
+    if body.get("api_client") in API_CLIENTS:
+        s["api_client"] = body["api_client"]
+    _OPENAI_CLIENTS.clear()            # rebuilt with the new settings on next use
     if body.get("embedding_mode") in ("local", "api"):
         s["embedding_mode"] = body["embedding_mode"]
     if "embedding_model" in body:
@@ -2911,6 +3088,9 @@ PAGE_HTML = r"""<!doctype html>
     <div class="small muted" id="set-key-status"></div>
     <label class="field">Max reply tokens
       <input id="set-max" type="number" min="256" step="256"></label>
+    <label class="field">API client
+      <select id="set-client"></select></label>
+    <div class="small muted" id="set-client-note"></div>
     <label class="field">Network route to the API
       <select id="set-proxy"></select></label>
     <div class="small muted" id="set-proxy-note"></div>
@@ -3165,6 +3345,12 @@ async function openSettings() {
   $("#set-proxy").innerHTML = Object.entries(s.proxy_modes || {})
     .map(([value, label]) => `<option value="${value}">${esc(label)}</option>`).join("");
   $("#set-proxy").value = s.proxy_mode || "env";
+  $("#set-client").innerHTML = Object.entries(s.api_clients || {})
+    .map(([value, label]) => `<option value="${value}">${esc(label)}</option>`).join("");
+  $("#set-client").value = s.api_client || "auto";
+  $("#set-client-note").textContent = s.openai_installed
+    ? `openai library ${s.openai_installed} is installed.`
+    : "The openai library is not installed (py -m pip install openai); the built-in client is used.";
   $("#set-proxy-note").textContent = `Proxy in Windows internet settings: ${s.windows_proxy}.`
     + " If requests fail with WinError 10054 after ~90 s, avoid routing through it.";
   $("#set-stream-note").textContent = s.stream_rejected
@@ -3192,6 +3378,7 @@ async function saveSettings(extra = {}) {
     embedding_mode: $("#set-embed-mode").value, embedding_model: $("#set-embed-model").value,
     chunk_chars: $("#set-chunk").value,
     stream: $("#set-stream").checked, proxy_mode: $("#set-proxy").value,
+    api_client: $("#set-client").value,
     ...extra };
   const key = $("#set-key").value.trim();
   if (key) body.api_key = key;

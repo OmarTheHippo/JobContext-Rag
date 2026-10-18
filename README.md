@@ -52,6 +52,11 @@ first time a folder is indexed. With an API embedding model nothing is downloade
   model, prose passages default to 3,000 characters; spreadsheet and CSV passages stay
   around 1,000 so single rows aren't buried. Texts are sent 20 per request. Changing
   the model or passage size requires re-indexing; the editor flags affected folders.
+- **API client.** Requests go through the `openai` Python library when it is installed
+  (it is in `requirements-rag.txt`). On some agency networks the gateway stalls requests
+  from Python's built-in client until they are dropped (WinError 10054 after ~90 s)
+  while the same requests through the library work. The built-in client remains as a
+  fallback and can be chosen in Settings.
 - **Network route.** By default the app connects like most API client libraries:
   it ignores the proxy in Windows' internet settings and only honours `HTTPS_PROXY` /
   `HTTP_PROXY` environment variables. Some agency proxies hold non-streamed requests
@@ -69,7 +74,7 @@ first time a folder is indexed. With an API embedding model nothing is downloade
 |---|---|
 | `jobcontext.txt` | The app: Python plus the web page's HTML, CSS and JavaScript (runs with `py jobcontext.txt`) |
 | `jobcontext_rag.py` | Text extraction, chunking, local indexing and search (Chroma) |
-| `requirements-rag.txt` | Python packages for document search |
+| `requirements-rag.txt` | Python packages: document search and the `openai` API client |
 | `install.bat` | Installer for Windows |
 | `test.py` | Live diagnostic tests against your real API (see below) |
 
@@ -82,6 +87,7 @@ search index, settings) and is excluded from git.
 Settings, to pin down connection problems:
 
 ```
+py test.py openai
 py test.py embeddings
 py test.py chat
 py test.py all

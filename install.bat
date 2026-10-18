@@ -35,8 +35,9 @@ if errorlevel 1 (
 )
 echo Using: %PY%
 
-rem Document-search packages (Chroma, PDF/Word/Excel readers). Installed once.
-%PY% -c "import chromadb, pypdf, docx, openpyxl" >nul 2>nul
+rem Packages: document search (Chroma, PDF/Word/Excel readers) and the openai
+rem library used to call the API. Installed once.
+%PY% -c "import chromadb, pypdf, docx, openpyxl, openai" >nul 2>nul
 if errorlevel 1 (
   echo Installing document-search packages from requirements-rag.txt...
   %PY% -m pip install -r requirements-rag.txt
