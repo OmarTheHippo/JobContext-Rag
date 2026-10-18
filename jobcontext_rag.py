@@ -866,8 +866,10 @@ def index_layer(kind: str,
         documents = []
         metadatas = []
 
+        embedded = 0
+
         def flush() -> None:
-            nonlocal ids, documents, metadatas
+            nonlocal ids, documents, metadatas, embedded
 
             if not ids:
                 return
@@ -879,6 +881,9 @@ def index_layer(kind: str,
                 metadatas=metadatas,
                 embeddings=embed(documents),
             )
+            embedded += len(ids)
+            if progress:
+                progress({"phase": "embedded", "embedded": embedded})
             ids = []
             documents = []
             metadatas = []

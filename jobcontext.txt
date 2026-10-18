@@ -48,7 +48,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.1"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -427,6 +427,7 @@ def _read_stream(response) -> str:
 
 
 API_ATTEMPTS = 4                     # first try + 3 retries
+SPLIT_ATTEMPTS = 2                   # tries per piece once a request is being split up
 API_TIMEOUT_SECONDS = 300
 RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
@@ -570,7 +571,7 @@ def _embeddings_endpoint(s: dict) -> str:
     return base + "/embeddings" if base else ""
 
 
-def _genai_embed(texts: list[str], s: dict) -> list[list[float]]:
+def _genai_embed(texts: list[str], s: dict, attempts: int | None = None) -> list[list[float]]:
     """One embeddings request (up to EMBED_BATCH texts), with the same retries as chat."""
     url, key, model = _embeddings_endpoint(s), get_api_key(), (s.get("embedding_model") or "").strip()
     if not url:
@@ -584,8 +585,9 @@ def _genai_embed(texts: list[str], s: dict) -> list[list[float]]:
         "Content-Type": "application/json", "Authorization": f"Bearer {key}"})
     size = f"{len(texts)} texts, ~{len(payload) // 4:,} tokens"
 
+    total = attempts or API_ATTEMPTS
     durations: list[float] = []
-    for attempt in range(1, API_ATTEMPTS + 1):
+    for attempt in range(1, total + 1):
         started = time.time()
         try:
             with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
@@ -593,7 +595,7 @@ def _genai_embed(texts: list[str], s: dict) -> list[list[float]]:
             break
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:500]
-            if e.code not in RETRYABLE_HTTP_STATUS or attempt == API_ATTEMPTS:
+            if e.code not in RETRYABLE_HTTP_STATUS or attempt == total:
                 raise LLMError(f"Embeddings API error {e.code}: {detail} ({size})")
             wait, problem = _retry_wait(attempt, e.headers.get("Retry-After")), f"HTTP {e.code}"
         except (urllib.error.URLError, ConnectionError, TimeoutError,
@@ -601,12 +603,15 @@ def _genai_embed(texts: list[str], s: dict) -> list[list[float]]:
             reason = getattr(e, "reason", None) or e
             problem = f"{type(reason).__name__}: {reason}"
             durations.append(time.time() - started)
-            if attempt == API_ATTEMPTS:
+            if attempt == total:
+                ran = ", ".join(f"{d:.1f}s" for d in durations)
                 raise ConnectionFailed(f"Embeddings request failed {attempt} times "
-                                       f"({problem}; {size}).", durations)
+                                       f"({problem}; {size}; attempts ran {ran} before "
+                                       "failing).", durations)
             wait = _retry_wait(attempt)
-        print(f"Embeddings request failed ({problem}; {size}); retry {attempt + 1} of "
-              f"{API_ATTEMPTS} in {wait:.0f}s", flush=True)
+        print(f"Embeddings request failed ({problem}; {size}; failed after "
+              f"{time.time() - started:.1f}s); retry {attempt + 1} of {total} in {wait:.0f}s",
+              flush=True)
         time.sleep(wait)
 
     try:
@@ -626,14 +631,50 @@ def _genai_embed(texts: list[str], s: dict) -> list[list[float]]:
     return out
 
 
+# Embeddings can't be streamed, so a slow request is silent until it finishes and a
+# strict proxy may drop it (WinError 10054). The app adapts: after the first dropped
+# embeddings request it sends them one at a time for the rest of the session, and a
+# batch that keeps failing is split in half (down to single passages).
+_EMBED_ONE_AT_A_TIME = [False]
+_EMBED_BATCH_LIMIT = [EMBED_BATCH]   # lowered when a batch size proves too big
+
+
+def _embed_batch(batch: list[str], s: dict, attempts: int | None = None) -> list[list[float]]:
+    try:
+        return _genai_embed(batch, s, attempts)
+    except ConnectionFailed as exc:
+        if not _EMBED_ONE_AT_A_TIME[0]:
+            _EMBED_ONE_AT_A_TIME[0] = True
+            print("Embedding requests are being dropped; sending them one at a time "
+                  "from now on.", flush=True)
+        if len(batch) == 1:
+            ran = ", ".join(f"{d:.1f}s" for d in exc.durations)
+            raise ConnectionFailed(
+                f"A single passage ({len(batch[0]):,} characters) could not be embedded: "
+                f"the connection was dropped every time (attempts ran {ran}). If the "
+                "times are long, lower Settings > Passage size; if instant, the gateway "
+                "may be refusing the request.", exc.durations)
+        half = len(batch) // 2
+        if half < _EMBED_BATCH_LIMIT[0]:
+            _EMBED_BATCH_LIMIT[0] = half     # later batches start at the smaller size
+        print(f"Embeddings request with {len(batch)} passages keeps failing; trying "
+              f"{half} and {len(batch) - half} (later requests use at most "
+              f"{_EMBED_BATCH_LIMIT[0]}).", flush=True)
+        return (_embed_batch(batch[:half], s, SPLIT_ATTEMPTS)
+                + _embed_batch(batch[half:], s, SPLIT_ATTEMPTS))
+
+
 def api_embed(texts: list[str]) -> list[list[float]]:
-    """Embed any number of texts: batches of EMBED_BATCH, several in parallel."""
+    """Embed any number of texts: batches of EMBED_BATCH, several in parallel unless
+    embedding requests have been dropped this session (then one at a time)."""
     s = load_settings()
-    batches = [texts[i:i + EMBED_BATCH] for i in range(0, len(texts), EMBED_BATCH)]
-    if len(batches) == 1:
-        return _genai_embed(batches[0], s)
-    with ThreadPoolExecutor(max_workers=min(_parallel_requests(), len(batches))) as pool:
-        results = list(pool.map(lambda batch: _genai_embed(batch, s), batches))
+    size = _EMBED_BATCH_LIMIT[0]
+    batches = [texts[i:i + size] for i in range(0, len(texts), size)]
+    workers = 1 if _EMBED_ONE_AT_A_TIME[0] else min(_parallel_requests(), len(batches))
+    if workers <= 1:
+        return [vector for batch in batches for vector in _embed_batch(batch, s)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(lambda batch: _embed_batch(batch, s), batches))
     return [vector for batch in results for vector in batch]
 
 
@@ -1333,7 +1374,6 @@ def brief_section(layer: dict) -> str:
 # When a card request keeps failing at the connection level, the text is split in
 # half and each half retried, down to pieces of about this size.
 MIN_SPLIT_CHARS = 1500
-SPLIT_ATTEMPTS = 2          # tries per piece while narrowing down (first try uses all)
 
 
 def _card_for_text(label: str, text: str, guidance: str, attempts: int | None = None) -> dict:
@@ -1691,6 +1731,8 @@ def set_settings(body, query):
         s["api_key_enc"] = encrypt_key(body["api_key"].strip())
     s["parallel_requests"] = max(1, min(8, int(s.get("parallel_requests") or 4)))
     save_settings(s)
+    # New settings (e.g. a smaller passage size): try full-size, parallel batches again.
+    _EMBED_ONE_AT_A_TIME[0], _EMBED_BATCH_LIMIT[0] = False, EMBED_BATCH
     apply_search_settings(s)
     return get_settings({}, {})
 
@@ -1789,30 +1831,15 @@ def get_repository(kind, item_id, body, query):
     return repo
 
 
-@route("POST", f"/api/{K}/{I}/repository/index")
-def index_repository(kind, item_id, body, query):
-    """
-    Full local re-index of a layer repository.
+INDEX_JOBS: dict[str, dict] = {}
+INDEX_LOCK = threading.Lock()
 
-    Request body:
-        {"path": "C:\\Users\\...\\Documents\\ProjectFolder"}
-    """
-    layer = load(kind, item_id)
-    path = str(body.get("path") or "").strip()
 
-    if not path:
-        raise HttpError(400, "Enter a repository folder path before indexing.")
+def run_index(kind: str, item_id: str, path: str, progress=None) -> dict:
+    """Index a folder now (raises on failure) and save the layer's repository info."""
+    result = rag.index_layer(kind, item_id, path, progress=progress)
 
-    try:
-        result = rag.index_layer(kind, item_id, path)
-    except (ValueError, RuntimeError) as exc:
-        raise HttpError(400, str(exc))
-    except LLMError as exc:                 # embedding API problem: say what, no traceback
-        raise HttpError(502, f"Indexing failed: {exc}")
-    except Exception as exc:
-        traceback.print_exc()
-        raise HttpError(500, f"Indexing failed: {exc}")
-
+    layer = load(kind, item_id)                     # fresh copy: keep edits made meanwhile
     repository = dict(_default_repository(kind, item_id))
     repository.update(layer.get("repository") or {})
     repository.update({
@@ -1827,15 +1854,70 @@ def index_repository(kind, item_id, body, query):
         "error": "",
         "failed": result.get("failed", []),
     })
-
     layer["repository"] = repository
     layer["updated"] = time.time()
     save(kind, layer)
+    return {"repository": repository, "source_files_seen": result.get("source_files_seen", 0)}
 
-    return {
-        "repository": repository,
-        "source_files_seen": result.get("source_files_seen", 0),
-    }
+
+def _index_worker(kind: str, item_id: str, path: str) -> None:
+    key = f"{kind}:{item_id}"
+
+    def progress(update: dict) -> None:
+        with INDEX_LOCK:
+            job = INDEX_JOBS[key]
+            if update.get("phase") == "embedded":
+                job["embedded"] = update.get("embedded", 0)
+            else:
+                job.update({k: update[k] for k in ("done", "total", "file") if k in update})
+
+    try:
+        result = run_index(kind, item_id, path, progress)
+        with INDEX_LOCK:
+            INDEX_JOBS[key].update(state="done", finished=time.time(),
+                                   repository=result["repository"])
+        # Projects get a fresh brief after each index. Unchanged files reuse their
+        # cached cards, so only new or changed files cost API calls.
+        if kind == "projects" and result["repository"]["file_count"]:
+            start_brief_job(item_id)
+    except Exception as exc:
+        if not isinstance(exc, (ValueError, RuntimeError, LLMError)):
+            traceback.print_exc()
+        with INDEX_LOCK:
+            INDEX_JOBS[key].update(state="error", error=str(exc), finished=time.time())
+
+
+@route("POST", f"/api/{K}/{I}/repository/index")
+def index_repository(kind, item_id, body, query):
+    """
+    Start indexing a layer's folder in the background; poll GET for progress.
+
+    Request body:
+        {"path": "<folder to index>"}
+    """
+    load(kind, item_id)                             # 404 if the layer doesn't exist
+    path = str(body.get("path") or "").strip()
+    if not path:
+        raise HttpError(400, "Enter a repository folder path before indexing.")
+
+    key = f"{kind}:{item_id}"
+    with INDEX_LOCK:
+        job = INDEX_JOBS.get(key)
+        if job and job.get("state") == "running":
+            return {"job": dict(job)}
+        INDEX_JOBS[key] = {
+            "state": "running", "done": 0, "total": 0, "file": "", "embedded": 0,
+            "error": "", "started": time.time(),
+            "embedding": rag.EMBED_ID, "uses_api": rag.EMBED_ID.startswith("api:"),
+        }
+    threading.Thread(target=_index_worker, args=(kind, item_id, path), daemon=True).start()
+    return {"job": dict(INDEX_JOBS[key])}
+
+
+@route("GET", f"/api/{K}/{I}/repository/index")
+def index_progress(kind, item_id, body, query):
+    with INDEX_LOCK:
+        return {"job": dict(INDEX_JOBS.get(f"{kind}:{item_id}") or {})}
 
 
 @route("DELETE", f"/api/{K}/{I}/repository")
@@ -3887,6 +3969,63 @@ function repositoryStatusText(layer) {
   return `${repo.file_count || 0} file(s), ${repo.chunk_count || 0} passages. ${indexed}${failures}${stale}`;
 }
 
+// --- indexing progress ----------------------------------------------------------------
+// Indexing runs in the background on the server; this shows its progress every
+// second while the layer stays open, then refreshes the editor when it finishes.
+async function watchIndexing(kind, layerId, quietIfIdle = false) {
+  clearTimeout(state.indexPoll);
+  if (state.libSel !== layerId || !$("#repo-detail")) return;
+
+  let job;
+  try {
+    job = (await api(`/api/${kind}/${layerId}/repository/index`)).job || {};
+  } catch (error) {
+    $("#repo-detail").textContent = error.message;
+    return;
+  }
+  if (state.libSel !== layerId || !$("#repo-detail")) return;
+
+  const detail = $("#repo-detail");
+  const how = job.uses_api
+    ? `API embedding model (${job.embedding.replace("api:", "")})`
+    : "local embedding model";
+
+  if (job.state === "running") {
+    $("#repo-index").disabled = true;
+    detail.textContent =
+      `Indexing with the ${how}: `
+      + (job.total ? `${job.done} of ${job.total} files read` : "finding files")
+      + (job.file ? ` (now: ${job.file})` : "")
+      + (job.embedded ? ` · ${job.embedded} passages embedded` : "")
+      + "…";
+    state.indexPoll = setTimeout(() => watchIndexing(kind, layerId), 1000);
+    return;
+  }
+
+  $("#repo-index").disabled = false;
+  if (quietIfIdle || !job.state) return;
+
+  if (job.state === "error") {
+    detail.textContent = `Indexing failed: ${job.error}`;
+    toast("Indexing failed");
+    return;
+  }
+
+  // Finished: update the layer and redraw (the brief panel then shows its progress).
+  const index = state[kind].findIndex((item) => item.id === layerId);
+  if (index >= 0 && job.repository) state[kind][index].repository = job.repository;
+  renderLibList();
+  renderLibEdit();
+  const repo = job.repository || {};
+  const failed = repo.failed || [];
+  $("#repo-detail").textContent =
+    `Indexed ${repo.file_count} file(s) into ${repo.chunk_count} passages with the ${how}.`
+    + (failed.length ? ` ${failed.length} file(s) were skipped.` : "");
+  toast(kind === "projects" && repo.file_count
+    ? "Indexing complete - generating the project brief"
+    : "Indexing complete");
+}
+
 // --- project brief panel --------------------------------------------------------------
 // Shows the brief and its file cards; while a brief is being generated, re-checks
 // every 1.5 s until it finishes (only while that project is still open).
@@ -3996,8 +4135,10 @@ function renderLibEdit() {
       <h3>Local document repository</h3>
 
       <p class="muted small">
-        Indexing stays local. When this layer is active, Hybrid mode retrieves
-        relevant passages from this folder; All active documents sends all
+        Files are read and the search index is kept on this PC. With an API embedding
+        model (Settings &gt; Document search), each passage's text is sent to the API
+        once to compute its embedding. When this layer is active, Hybrid mode
+        retrieves relevant passages from this folder; All active documents sends all
         extracted text only if it fits the configured context budget.
       </p>
 
@@ -4128,46 +4269,19 @@ function renderLibEdit() {
       return;
     }
 
-    const button = $("#repo-index");
-    const detail = $("#repo-detail");
-
-    button.disabled = true;
-    detail.textContent = "Indexing locally. This can take time for a large folder.";
-
+    $("#repo-index").disabled = true;
     try {
-      const result = await api(`/api/${kind}/${layer.id}/repository/index`, {
-        json: { path: folder },
-      });
-
-      const index = state[kind].findIndex((item) => item.id === layer.id);
-      if (index >= 0) {
-        state[kind][index].repository = result.repository;
-      }
-
-      const failed = result.repository.failed || [];
-      detail.textContent =
-        `Indexed ${result.repository.file_count} file(s) into `
-        + `${result.repository.chunk_count} passages.`
-        + (failed.length ? ` ${failed.length} file(s) were skipped.` : "");
-
-      // Projects get a fresh brief after each index. Unchanged files reuse their
-      // cached file cards, so only new or changed files cost API calls.
-      if (kind === "projects" && result.repository.file_count) {
-        await api(`/api/projects/${layer.id}/brief`, { json: {} }).catch(() => {});
-      }
-
-      renderLibList();
-      renderLibEdit();
-      toast(kind === "projects"
-        ? "Indexing complete - generating the project brief"
-        : "Repository indexing complete");
+      await api(`/api/${kind}/${layer.id}/repository/index`, { json: { path: folder } });
+      watchIndexing(kind, layer.id);
     } catch (error) {
-      detail.textContent = error.message;
+      $("#repo-index").disabled = false;
+      $("#repo-detail").textContent = error.message;
       toast(error.message);
-    } finally {
-      button.disabled = false;
     }
   };
+
+  // Pick up an indexing run that is already in progress (e.g. after reopening).
+  watchIndexing(kind, layer.id, true);
 
   $("#repo-refresh").onclick = async () => {
     try {
