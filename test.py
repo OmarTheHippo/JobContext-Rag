@@ -2,6 +2,7 @@
 
 Run from the app folder (next to jobcontext.txt), after Settings are saved in the app:
 
+    py test.py replica         # your own system-prompt test, then step by step to the app's
     py test.py system          # are system messages and conversation turns honoured?
     py test.py openai          # the app's requests sent through the openai library
     py test.py embeddings      # embedding model: which request shapes work or hang
@@ -449,7 +450,101 @@ def test_system(app, out):
         out("  - The model didn't recall the code word from a transcript: send this file to Claude.")
 
 
-TESTS = {"system": test_system, "openai": test_openai, "embeddings": test_embeddings,
+# ---- replica of the user's own system-prompt test ---------------------------------------
+
+def test_replica(app, out):
+    """Reproduce a system-prompt test that is known to work on this gateway, then change one
+    thing at a time towards what the app sends, to find the difference that breaks it."""
+    out("REPLICA OF YOUR SYSTEM-PROMPT TEST")
+    try:
+        import openai
+    except ImportError:
+        out("  The openai library is not installed: py -m pip install openai")
+        return
+    s = app.load_settings()
+    key, model = app.get_api_key(), app._model(s)
+    base = app._chat_endpoint(s)
+    base = base[: -len(app.CHAT_PATH)] if base.endswith(app.CHAT_PATH) else base
+    if not (base and key and model):
+        out("  Set the Base URL, API key and model in the app's Settings first.")
+        return
+    max_tokens = int(s.get("max_tokens") or 4000)
+    out(f"  model from Settings: {model}")
+    out(f"  base URL: {base}")
+    out(f"  reply limit in Settings (max_tokens): {max_tokens:,}")
+    out("  Compare the model above with the one in your own test script.")
+    client = openai.OpenAI(base_url=base, api_key=key, timeout=TIMEOUT, max_retries=0)
+
+    codeword_system = ("You are a helpful assistant. Regardless of user query, you must always "
+                       "conclude your final response with the exact token: CODEWORD 42")
+    photosynthesis = [{"role": "user", "content": "Explain photosynthesis"}]
+    jc_rule = "Formatting rule: begin every reply with the exact text [JC-OK] followed by a space."
+    sky = [{"role": "user", "content": "In one short sentence: what colour is the sky on a clear day?"}]
+    turns = [
+        {"role": "user", "content": "Please remember this code word for later: HYDRANT."},
+        {"role": "assistant", "content": "Noted - I'll remember the code word."},
+        {"role": "user", "content": "What was the code word I gave you? Reply with only the word."},
+    ]
+
+    def direct(messages, **extra):
+        r = client.chat.completions.create(model=model, messages=messages, **extra)
+        return r.choices[0].message.content or ""
+
+    def check(label, fn, expect):
+        started = time.time()
+        try:
+            reply = fn().strip()
+            ok = expect.lower() in reply.lower()
+            tail = reply[-60:] if len(reply) > 60 else reply
+            out(f"  {'OK  ' if ok else 'MISS'}  {label:<52} {time.time() - started:.1f}s - "
+                f"reply ends: {tail!r}")
+            return ok
+        except Exception as e:                               # noqa: BLE001
+            out(f"  FAIL  {label:<52} after {time.time() - started:.1f}s - {str(e)[:140]}")
+            return False
+
+    sys_msg = lambda text: [{"role": "system", "content": text}]
+    a = check("A. your codeword test, direct, no reply limit",
+              lambda: direct(sys_msg(codeword_system) + photosynthesis), "CODEWORD 42")
+    b = check("B. same, with the app's reply limit",
+              lambda: direct(sys_msg(codeword_system) + photosynthesis, max_tokens=max_tokens),
+              "CODEWORD 42")
+    native = dict(s, message_format="native", stream=False)
+    c = check("C. same, through the app's own code (Native)",
+              lambda: app.PROVIDERS["genai"](codeword_system, photosynthesis, native, 1),
+              "CODEWORD 42")
+    d = check("D. the [JC-OK] rule, direct, no reply limit",
+              lambda: direct(sys_msg(jc_rule) + sky), "[JC-OK]")
+    e = check("E. earlier turns, direct, no reply limit",
+              lambda: direct(sys_msg("Answer briefly.") + turns), "HYDRANT")
+
+    out("")
+    out("  The exact request body the app sends for C (no key):")
+    body = {"model": model, "messages": app._wire_messages(codeword_system, photosynthesis, native),
+            "max_tokens": max_tokens}
+    for text_line in json.dumps(body, indent=2).splitlines():
+        out("    " + text_line)
+
+    out("")
+    out("  What this suggests:")
+    if a and not b:
+        out("  - The reply limit (max_tokens) breaks it: Claude can stop sending it.")
+    elif a and b and not c:
+        out("  - Direct works but the app's code doesn't: compare the body above with your")
+        out("    script's request and send this file to Claude.")
+    elif a and b and c and not d:
+        out("  - System messages work; the model just didn't follow the [JC-OK] rule. Native")
+        out("    format should be fine - send this file to Claude.")
+    elif not a:
+        out("  - Even your own test fails with this model: check whether your script used a")
+        out("    different model than the one in Settings.")
+    if a and not e:
+        out("  - Earlier turns are not passed to the model even when sent directly.")
+    if a and b and c and d and e:
+        out("  - Everything works direct and through the app: send this file to Claude.")
+
+
+TESTS = {"replica": test_replica, "system": test_system, "openai": test_openai, "embeddings": test_embeddings,
          "chat": test_chat}
 
 
