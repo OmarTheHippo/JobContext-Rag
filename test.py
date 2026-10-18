@@ -389,28 +389,35 @@ def test_system(app, out):
                   "# Current User Request\nWhat was the code word I gave you? Reply with only "
                   "the word.")
 
-    def run(label, system, messages, fmt, expect):
+    def run(label, system, messages, fmt, expect, stream):
         started = time.time()
+        label = f"{label}, {'streamed' if stream else 'not streamed'}"
         try:
-            reply = provider(system, messages, dict(s, message_format=fmt), 1).strip()
+            # Reset the app's "gateway doesn't stream" memory so each probe really
+            # uses the mode it asks for.
+            app._STREAM_REJECTED[0] = False
+            reply = provider(system, messages, dict(s, message_format=fmt, stream=stream),
+                             1).strip()
             ok = expect.lower() in reply.lower()
-            out(f"  {'OK  ' if ok else 'MISS'}  {label:<48} {time.time() - started:.1f}s - "
-                f"replied: {reply[:70]!r}")
+            out(f"  {'OK  ' if ok else 'MISS'}  {label:<58} {time.time() - started:.1f}s - "
+                f"replied: {reply[:60]!r}")
             return ok
         except Exception as e:                               # noqa: BLE001
-            out(f"  FAIL  {label:<48} after {time.time() - started:.1f}s - {str(e)[:140]}")
+            out(f"  FAIL  {label:<58} after {time.time() - started:.1f}s - {str(e)[:140]}")
             return False
 
-    base = run("1. plain request in the user message", "Answer briefly.",
+    base = run("1. plain request", "Answer briefly.",
                [{"role": "user", "content": "Reply with exactly this word and nothing else: "
-                                            "PINEAPPLE"}], "native", "PINEAPPLE")
-    native_rule = run("2. standing rule as a system message", rule, sky, "native", marker)
-    combined_rule = run("3. standing rule inside the user message (Combined)", rule, sky,
-                        "combined", marker)
-    native_turns = run("4. earlier turns as real messages (Native)", "Answer briefly.", turns,
-                       "native", "HYDRANT")
-    combined_turns = run("5. earlier turns as a transcript (Combined)", "Answer briefly.",
-                         [{"role": "user", "content": transcript}], "combined", "HYDRANT")
+                                            "PINEAPPLE"}], "native", "PINEAPPLE", False)
+    native_rule = {st: run("2. rule as a system message", rule, sky, "native", marker, st)
+                   for st in (False, True)}
+    combined_rule = {st: run("3. rule inside the user message (Combined)", rule, sky,
+                             "combined", marker, st) for st in (False, True)}
+    native_turns = {st: run("4. earlier turns as real messages (Native)", "Answer briefly.",
+                            turns, "native", "HYDRANT", st) for st in (False, True)}
+    combined_turns = {st: run("5. earlier turns as a transcript (Combined)", "Answer briefly.",
+                              [{"role": "user", "content": transcript}], "combined", "HYDRANT",
+                              st) for st in (False, True)}
 
     out("")
     out("  What this suggests:")
@@ -418,14 +425,23 @@ def test_system(app, out):
         out("  - The model didn't follow even a plain request: the other results can't be read.")
         out("    Run again; if it repeats, send this file to Claude.")
         return
-    if native_rule and native_turns:
-        out("  - The gateway passes system messages and earlier turns: Native format works.")
+    plain_native = native_rule[False] and native_turns[False]
+    streamed_native = native_rule[True] and native_turns[True]
+    if plain_native and not streamed_native:
+        out("  - System messages and earlier turns work when NOT streamed but are lost when")
+        out("    streamed: the gateway's streaming path drops them. Tell Claude - the app can")
+        out("    send Native-format requests without streaming.")
+    elif plain_native and streamed_native:
+        out("  - The gateway passes system messages and earlier turns either way: Native")
+        out("    format works.")
     else:
-        if not native_rule:
+        if not (native_rule[False] or native_rule[True]):
             out("  - System messages are not reaching the model (or are ignored).")
-        if not native_turns:
+        if not (native_turns[False] or native_turns[True]):
             out("  - Earlier turns sent as separate messages are not reaching the model.")
         out("  - Keep Settings > Message format on Combined.")
+    combined_rule = combined_rule[False] and combined_rule[True]
+    combined_turns = combined_turns[False] and combined_turns[True]
     if not combined_rule:
         out("  - Standing instructions inside the user message were not followed either:")
         out("    layer prompts may be ignored. Send this file to Claude.")
