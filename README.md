@@ -66,9 +66,25 @@ first time a folder is indexed. With an API embedding model nothing is downloade
 | `jobcontext_rag.py` | Text extraction, chunking, local indexing and search (Chroma) |
 | `requirements-rag.txt` | Python packages for document search |
 | `install.bat` | Installer for Windows |
+| `test.py` | Live diagnostic tests against your real API (see below) |
 
 Everything you create lives in `data\` next to the app (layers, chats, briefs, the local
 search index, settings) and is excluded from git.
+
+## Live diagnostic tests
+
+`test.py` sends a set of small, timed requests to your real API using the app's saved
+Settings, to pin down connection problems:
+
+```
+py test.py embeddings
+py test.py chat
+py test.py all
+```
+
+Each variation is sent once (no retries) and reported as OK or FAIL with timings and
+sizes, plus a short diagnosis. Results are saved to `test-results-<date>.txt` (no API
+key in it; excluded from git). New live tests can be added as functions in `test.py`.
 
 ## Known limits
 

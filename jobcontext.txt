@@ -24,7 +24,9 @@
 #  10. INSTALL & STARTUP
 
 import jobcontext_rag as rag
+import array
 import base64
+import gzip
 import hashlib
 import http.client
 import json
@@ -48,7 +50,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.2.1"
+APP_VERSION = "3.2.2"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -571,6 +573,39 @@ def _embeddings_endpoint(s: dict) -> str:
     return base + "/embeddings" if base else ""
 
 
+# Vectors are requested as base64 (packed 32-bit floats), which is ~4x smaller than
+# JSON numbers (20 x 3,072 numbers is ~1 MB as text) and what most client libraries
+# use by default. If the gateway refuses base64, plain numbers are used instead.
+_EMBED_FORMAT = ["base64"]
+
+
+def _decode_vector(value) -> list[float]:
+    if isinstance(value, str):                       # base64 of little-endian float32
+        packed = array.array("f")
+        packed.frombytes(base64.b64decode(value))
+        if sys.byteorder != "little":
+            packed.byteswap()
+        return packed.tolist()
+    return [float(x) for x in value]
+
+
+def _read_reply(r) -> tuple[bytes, dict]:
+    """Read a reply in pieces, noting how much arrived, so a failure can say whether
+    it happened before any reply or partway through downloading one."""
+    progress = {"bytes": 0}
+    chunks = []
+    while True:
+        chunk = r.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        progress["bytes"] += len(chunk)
+    body = b"".join(chunks)
+    if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+        body = gzip.decompress(body)
+    return body, progress
+
+
 def _genai_embed(texts: list[str], s: dict, attempts: int | None = None) -> list[list[float]]:
     """One embeddings request (up to EMBED_BATCH texts), with the same retries as chat."""
     url, key, model = _embeddings_endpoint(s), get_api_key(), (s.get("embedding_model") or "").strip()
@@ -580,29 +615,59 @@ def _genai_embed(texts: list[str], s: dict, attempts: int | None = None) -> list
         raise LLMError("Set the embedding model in Settings > Document search.")
     if not key:
         raise LLMError("No API key - add it in Settings.")
-    payload = json.dumps({"model": model, "input": texts}).encode()
-    req = urllib.request.Request(url, data=payload, headers={
-        "Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Accept-Encoding": "gzip", "Authorization": f"Bearer {key}"}
+
+    def build():
+        body = {"model": model, "input": texts}
+        if _EMBED_FORMAT[0] == "base64":
+            body["encoding_format"] = "base64"
+        data = json.dumps(body).encode()
+        return urllib.request.Request(url, data=data, headers=headers), data, "encoding_format" in body
+
+    req, payload, sent_base64 = build()
     size = f"{len(texts)} texts, ~{len(payload) // 4:,} tokens"
 
     total = attempts or API_ATTEMPTS
     durations: list[float] = []
-    for attempt in range(1, total + 1):
-        started = time.time()
+    attempt = 0
+    while attempt < total:
+        attempt += 1
+        started, reply_at, received = time.time(), None, {"bytes": 0}
         try:
             with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
-                data = json.load(r)
+                reply_at = time.time() - started
+                raw, received = _read_reply(r)
+            data = json.loads(raw)
+            took = time.time() - started
+            if took > 15:
+                print(f"Embeddings request succeeded but took {took:.0f}s ({size}; reply "
+                      f"started after {reply_at:.0f}s, {len(raw) // 1024:,} KB).", flush=True)
             break
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:500]
+            if sent_base64 and e.code in (400, 415, 422):
+                # Gateway refuses base64 (checked against what THIS request sent, since
+                # another request may already have switched the setting).
+                if _EMBED_FORMAT[0] == "base64":
+                    _EMBED_FORMAT[0] = "float"
+                    print(f"Embeddings API refused base64 vectors (HTTP {e.code}); using "
+                          "plain numbers from now on.", flush=True)
+                req, payload, sent_base64 = build()
+                attempt -= 1
+                continue
             if e.code not in RETRYABLE_HTTP_STATUS or attempt == total:
                 raise LLMError(f"Embeddings API error {e.code}: {detail} ({size})")
             wait, problem = _retry_wait(attempt, e.headers.get("Retry-After")), f"HTTP {e.code}"
         except (urllib.error.URLError, ConnectionError, TimeoutError,
-                http.client.HTTPException, ValueError) as e:
+                http.client.HTTPException, ValueError, OSError) as e:
             reason = getattr(e, "reason", None) or e
-            problem = f"{type(reason).__name__}: {reason}"
-            durations.append(time.time() - started)
+            elapsed = time.time() - started
+            where = ("before any reply arrived" if reply_at is None else
+                     f"while downloading the reply (it started after {reply_at:.1f}s; "
+                     f"{received['bytes'] // 1024:,} KB received)")
+            problem = f"{type(reason).__name__}: {reason}; {where}"
+            durations.append(elapsed)
             if attempt == total:
                 ran = ", ".join(f"{d:.1f}s" for d in durations)
                 raise ConnectionFailed(f"Embeddings request failed {attempt} times "
@@ -616,8 +681,8 @@ def _genai_embed(texts: list[str], s: dict, attempts: int | None = None) -> list
 
     try:
         items = sorted(data["data"], key=lambda item: item.get("index", 0))
-        vectors = [item["embedding"] for item in items]
-    except (KeyError, TypeError):
+        vectors = [_decode_vector(item["embedding"]) for item in items]
+    except (KeyError, TypeError, ValueError):
         raise LLMError("Unexpected embeddings response: " + json.dumps(data)[:300])
     if len(vectors) != len(texts):
         raise LLMError(f"Embeddings API returned {len(vectors)} vectors for {len(texts)} texts.")

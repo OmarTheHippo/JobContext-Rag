@@ -6,3 +6,6 @@ Start Job-Context.bat
 
 __pycache__/
 *.pyc
+
+# Output of test.py (live diagnostics)
+test-results-*.txt
