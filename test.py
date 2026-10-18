@@ -405,7 +405,7 @@ def test_system(app, out):
             return ok
         except Exception as e:                               # noqa: BLE001
             out(f"  FAIL  {label:<58} after {time.time() - started:.1f}s - {str(e)[:140]}")
-            return False
+            return None              # the request errored: says nothing about the model
 
     base = run("1. plain request", "Answer briefly.",
                [{"role": "user", "content": "Reply with exactly this word and nothing else: "
@@ -426,9 +426,18 @@ def test_system(app, out):
         out("  - The model didn't follow even a plain request: the other results can't be read.")
         out("    Run again; if it repeats, send this file to Claude.")
         return
-    plain_native = native_rule[False] and native_turns[False]
-    streamed_native = native_rule[True] and native_turns[True]
-    if plain_native and not streamed_native:
+    # True = followed, False = MISS (model didn't follow), None = FAIL (request error).
+    def worked(*values):
+        return all(v is not False for v in values) and any(v is True for v in values)
+
+    errors = sum(v is None for d in (native_rule, combined_rule, native_turns, combined_turns)
+                 for v in d.values())
+    if errors:
+        out(f"  - {errors} request(s) FAILED with an error (see the FAIL lines). The model never")
+        out("    saw those, so they say nothing about instructions; run again to check them.")
+    plain_native = worked(native_rule[False], native_turns[False])
+    streamed_native = worked(native_rule[True], native_turns[True])
+    if plain_native and not streamed_native and False in (native_rule[True], native_turns[True]):
         out("  - System messages and earlier turns work when NOT streamed but are lost when")
         out("    streamed: the gateway's streaming path drops them. Tell Claude - the app can")
         out("    send Native-format requests without streaming.")
@@ -436,17 +445,15 @@ def test_system(app, out):
         out("  - The gateway passes system messages and earlier turns either way: Native")
         out("    format works.")
     else:
-        if not (native_rule[False] or native_rule[True]):
+        if False in native_rule.values():
             out("  - System messages are not reaching the model (or are ignored).")
-        if not (native_turns[False] or native_turns[True]):
+        if False in native_turns.values():
             out("  - Earlier turns sent as separate messages are not reaching the model.")
         out("  - Keep Settings > Message format on Combined.")
-    combined_rule = combined_rule[False] and combined_rule[True]
-    combined_turns = combined_turns[False] and combined_turns[True]
-    if not combined_rule:
-        out("  - Standing instructions inside the user message were not followed either:")
-        out("    layer prompts may be ignored. Send this file to Claude.")
-    if not combined_turns:
+    if False in combined_rule.values():
+        out("  - Standing instructions inside the user message were not followed (MISS):")
+        out("    layer prompts in Combined format may be ignored. Send this file to Claude.")
+    if False in combined_turns.values():
         out("  - The model didn't recall the code word from a transcript: send this file to Claude.")
 
 
