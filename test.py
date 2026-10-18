@@ -365,58 +365,72 @@ def test_openai(app, out):
 # ---- system messages and conversation turns --------------------------------------------
 
 def test_system(app, out):
-    """Does the gateway honour a real system message and earlier conversation turns?
-    Uses the app's own request code (API client, route, streaming) in both formats."""
+    """Which parts of a request does the gateway pass to the model? Uses cooperative
+    instructions (a marker at the start of the reply, a code word to recall) that don't
+    fight the user's question, sent through the app's own request code."""
     out("SYSTEM MESSAGES AND CONVERSATION TURNS")
     s = app.load_settings()
     if not app._model(s):
         out("  Set the Base URL, API key and model in the app's Settings first.")
         return
-    out(f"  app setting: message format {s.get('message_format', 'native')}, "
+    out(f"  app setting: message format {s.get('message_format', 'combined')}, "
         f"API client {s.get('api_client', 'auto')}")
     provider = app.PROVIDERS[s.get("provider", "genai")]
-
-    obey = ("You are a test fixture. Whatever the user writes, reply with exactly one "
-            "word: PINEAPPLE")
-    question = [{"role": "user", "content": "What colour is the sky on a clear day?"}]
-    memory = [
-        {"role": "user", "content": "Remember this code word for later: HYDRANT."},
-        {"role": "assistant", "content": "Noted."},
-        {"role": "user", "content": "What was the code word? Reply with only the word."},
+    marker = "[JC-OK]"
+    rule = f"Formatting rule: begin every reply with the exact text {marker} followed by a space."
+    sky = [{"role": "user", "content": "In one short sentence: what colour is the sky on a clear day?"}]
+    turns = [
+        {"role": "user", "content": "Please remember this code word for later: HYDRANT."},
+        {"role": "assistant", "content": "Noted - I'll remember the code word."},
+        {"role": "user", "content": "What was the code word I gave you? Reply with only the word."},
     ]
+    transcript = ("# Prior Conversation Transcript\n[USER]\nPlease remember this code word for "
+                  "later: HYDRANT.\n\n[ASSISTANT]\nNoted - I'll remember the code word.\n\n"
+                  "# Current User Request\nWhat was the code word I gave you? Reply with only "
+                  "the word.")
 
     def run(label, system, messages, fmt, expect):
         started = time.time()
         try:
             reply = provider(system, messages, dict(s, message_format=fmt), 1).strip()
-            verdict = "OK  " if expect.lower() in reply.lower() else "MISS"
-            out(f"  {verdict}  {label:<46} {time.time() - started:.1f}s - replied: "
-                f"{reply[:60]!r}")
-            return verdict == "OK  "
+            ok = expect.lower() in reply.lower()
+            out(f"  {'OK  ' if ok else 'MISS'}  {label:<48} {time.time() - started:.1f}s - "
+                f"replied: {reply[:70]!r}")
+            return ok
         except Exception as e:                               # noqa: BLE001
-            out(f"  FAIL  {label:<46} after {time.time() - started:.1f}s - {str(e)[:150]}")
+            out(f"  FAIL  {label:<48} after {time.time() - started:.1f}s - {str(e)[:140]}")
             return False
 
-    native_system = run("native: system message is obeyed", obey, question, "native",
-                        "PINEAPPLE")
-    native_turns = run("native: earlier turns are remembered", "Answer briefly.", memory,
+    base = run("1. plain request in the user message", "Answer briefly.",
+               [{"role": "user", "content": "Reply with exactly this word and nothing else: "
+                                            "PINEAPPLE"}], "native", "PINEAPPLE")
+    native_rule = run("2. standing rule as a system message", rule, sky, "native", marker)
+    combined_rule = run("3. standing rule inside the user message (Combined)", rule, sky,
+                        "combined", marker)
+    native_turns = run("4. earlier turns as real messages (Native)", "Answer briefly.", turns,
                        "native", "HYDRANT")
-    combined = run("combined: instructions in the user message", obey, question,
-                   "combined", "PINEAPPLE")
+    combined_turns = run("5. earlier turns as a transcript (Combined)", "Answer briefly.",
+                         [{"role": "user", "content": transcript}], "combined", "HYDRANT")
 
     out("")
     out("  What this suggests:")
-    if native_system and native_turns:
-        out("  - Native format works: keep Settings > Message format on Native.")
-    elif combined and not native_system:
-        out("  - The gateway ignores system messages: set Settings > Message format to")
-        out("    Combined.")
-    elif native_system and not native_turns:
-        out("  - System messages work but earlier turns aren't remembered: set Message")
-        out("    format to Combined (it sends the conversation as a transcript).")
+    if not base:
+        out("  - The model didn't follow even a plain request: the other results can't be read.")
+        out("    Run again; if it repeats, send this file to Claude.")
+        return
+    if native_rule and native_turns:
+        out("  - The gateway passes system messages and earlier turns: Native format works.")
     else:
-        out("  - Unclear (the model may just not have followed the test instruction):")
-        out("    run it again, or send this file to Claude.")
+        if not native_rule:
+            out("  - System messages are not reaching the model (or are ignored).")
+        if not native_turns:
+            out("  - Earlier turns sent as separate messages are not reaching the model.")
+        out("  - Keep Settings > Message format on Combined.")
+    if not combined_rule:
+        out("  - Standing instructions inside the user message were not followed either:")
+        out("    layer prompts may be ignored. Send this file to Claude.")
+    if not combined_turns:
+        out("  - The model didn't recall the code word from a transcript: send this file to Claude.")
 
 
 TESTS = {"system": test_system, "openai": test_openai, "embeddings": test_embeddings,

@@ -50,7 +50,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.5.1"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -210,8 +210,10 @@ DEFAULT_SETTINGS = {
     "proxy_mode": "env",
     # Which HTTP client sends API requests; see _use_openai().
     "api_client": "auto",
-    # How instructions and history are sent; see _wire_messages().
-    "message_format": "native",
+    # How instructions and history are sent; see _wire_messages(). Combined is the
+    # default because some gateways forward only the last user message (measured live:
+    # a system message and earlier turns were both ignored).
+    "message_format": "combined",
 }
 
 # Automatic shares of the context window, used when the overrides are 0.
@@ -489,18 +491,19 @@ def _retry_wait(attempt: int, retry_after: str | None = None) -> float:
 
 
 # ----- Message format -------------------------------------------------------------------
-# "native" (default): the standing instructions go in a real system message, and the
-#   caller's messages (which may include earlier conversation turns) follow as-is.
-# "combined": for gateways that ignore system messages - the instructions are put at
-#   the top of the last user message inside <standing_instructions> tags.
+# "combined" (default): the standing instructions go at the top of the last user message
+#   inside <standing_instructions> tags, and earlier turns are sent as a transcript in
+#   that same message. Works with gateways that forward only the last user message.
+# "native": a real system message and real conversation turns, for gateways that
+#   forward the whole conversation (check with py test.py system).
 MESSAGE_FORMATS = {
-    "native": "Native: system message + conversation turns (recommended)",
-    "combined": "Combined: everything in one user message (older gateways)",
+    "combined": "Combined: everything in one user message (works with most gateways)",
+    "native": "Native: system message + conversation turns",
 }
 
 
 def _wire_messages(system: str, messages: list, s: dict) -> list:
-    if s.get("message_format", "native") == "combined":
+    if s.get("message_format", "combined") == "combined":
         return messages[:-1] + [{"role": "user", "content": "<standing_instructions>\n" + system
                                  + "\n</standing_instructions>\n\n" + messages[-1]["content"]}]
     return [{"role": "system", "content": system}] + list(messages)
@@ -1226,7 +1229,7 @@ def build_chat_messages(chat: dict, current_request: str) -> list:
     messages (most recent first kept, within the chat-history budget), then the
     current request. Combined format: one user message with a transcript.
     """
-    if load_settings().get("message_format", "native") == "combined":
+    if load_settings().get("message_format", "combined") == "combined":
         return [{"role": "user", "content": build_conversation_request(chat, current_request)}]
 
     char_budget = budgets()["history"] * 4
@@ -2003,7 +2006,7 @@ def get_settings(body, query):
             "stream": s.get("stream", True),
             "proxy_mode": s.get("proxy_mode", "env"),
             "api_client": s.get("api_client", "auto"),
-            "message_format": s.get("message_format", "native"),
+            "message_format": s.get("message_format", "combined"),
             "message_formats": MESSAGE_FORMATS,
             "api_clients": API_CLIENTS,
             "openai_installed": (openai.__version__ if openai else ""),
@@ -3172,8 +3175,8 @@ PAGE_HTML = r"""<!doctype html>
       <input id="set-max" type="number" min="256" step="256"></label>
     <label class="field">Message format
       <select id="set-format"></select></label>
-    <div class="small muted">Check your gateway honours system messages and conversation
-      turns with <code>py test.py system</code>; if not, use Combined.</div>
+    <div class="small muted">Native only helps if your gateway forwards system messages
+      and earlier turns; check with <code>py test.py system</code> before switching.</div>
     <label class="field">API client
       <select id="set-client"></select></label>
     <div class="small muted" id="set-client-note"></div>
@@ -3436,7 +3439,7 @@ async function openSettings() {
   $("#set-client").value = s.api_client || "auto";
   $("#set-format").innerHTML = Object.entries(s.message_formats || {})
     .map(([value, label]) => `<option value="${value}">${esc(label)}</option>`).join("");
-  $("#set-format").value = s.message_format || "native";
+  $("#set-format").value = s.message_format || "combined";
   $("#set-client-note").textContent = s.openai_installed
     ? `openai library ${s.openai_installed} is installed.`
     : "The openai library is not installed (py -m pip install openai); the built-in client is used.";

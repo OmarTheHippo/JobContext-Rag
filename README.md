@@ -52,10 +52,11 @@ first time a folder is indexed. With an API embedding model nothing is downloade
   model, prose passages default to 3,000 characters; spreadsheet and CSV passages stay
   around 1,000 so single rows aren't buried. Texts are sent 20 per request. Changing
   the model or passage size requires re-indexing; the editor flags affected folders.
-- **Message format.** Native (default): layer prompts are sent as a real system message
-  and earlier turns as a real conversation, within the chat-history budget. Combined:
-  everything in one user message, for gateways that ignore system messages.
-  `py test.py system` checks which your gateway honours.
+- **Message format.** Combined (default): layer prompts and the earlier conversation go
+  into one user message, which works with gateways that forward only the last user
+  message. Native: a real system message and real conversation turns, for gateways
+  that forward the whole conversation. `py test.py system` shows which parts of a
+  request reach the model and which format to use.
 - **API client.** Requests go through the `openai` Python library when it is installed
   (it is in `requirements-rag.txt`). On some agency networks the gateway stalls requests
   from Python's built-in client until they are dropped (WinError 10054 after ~90 s)
