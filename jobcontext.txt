@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.8.0"
+APP_VERSION = "3.9.0"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -1311,6 +1311,14 @@ def build_system_prompt(chat: dict) -> str:
         "confident you are, and what would confirm it. For example: 'Document A says the "
         "tanks were built in 2015 and Document B says P664 installed piping in 2015; "
         "these may be the same project, but no document links them.'\n"
+        "- Source labels may show a document's version and date, and where each came "
+        "from (file name, first page, email, file properties, or the file date, which "
+        "is the least reliable). Folders often hold several versions of a document. "
+        "When sources give different values or requirements for the same item, show "
+        "each with its document, version and date, say which appears current and why "
+        "(later document date, higher revision, or a statement that one supersedes "
+        "the other), and do not silently pick one or merge them. If the order is "
+        "unclear, say so. Different values for different items are not a conflict.\n"
         "- Do not claim to have reviewed documents that were not supplied as retrieved "
         "reference material for this request.\n"
         "- When a source label identifies a document and location, cite that source "
@@ -2346,6 +2354,8 @@ def run_index(kind: str, item_id: str, path: str, progress=None, rebuild: bool =
         "warnings": result.get("warnings", []),
         "unsupported": result.get("unsupported", {}),
         "timings": result.get("timings", {}),
+        "versions": result.get("versions", []),
+        "supersedes": result.get("supersedes", []),
     })
     layer["repository"] = repository
     layer["updated"] = time.time()
@@ -4541,6 +4551,9 @@ function indexProblemsText(repo) {
   if (failed) parts.push(`${failed} file(s) could not be read`);
   if (partial) parts.push(`${partial} note(s) on files read in part`);
   if (skipped) parts.push(`${skipped} file(s) of types that aren't read`);
+  if ((repo.versions || []).length) {
+    parts.push(`${repo.versions.length} group(s) of files that look like versions of one document`);
+  }
   return parts.length ? parts.join(", ") + " (see the index report below)." : "";
 }
 
@@ -4560,8 +4573,11 @@ function indexReportHtml(repo) {
   const failed = repo.failed || [];
   const warnings = repo.warnings || [];
   const unsupported = Object.entries(repo.unsupported || {});
+  const versions = repo.versions || [];
+  const supersedes = repo.supersedes || [];
   const timingHtml = timing ? `<div class="muted">${esc(timing)}</div>` : "";
-  if (!failed.length && !warnings.length && !unsupported.length) return timingHtml;
+  if (!failed.length && !warnings.length && !unsupported.length && !versions.length
+      && !supersedes.length) return timingHtml;
   const list = (items) => `<ul>${items.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`;
   const sections = [];
   if (failed.length) {
@@ -4576,7 +4592,21 @@ function indexReportHtml(repo) {
         <div class="source-location">${esc((group.files || []).join(", "))}${
           group.count > (group.files || []).length ? ", …" : ""}</div></li>`).join("")}</ul>`);
   }
-  return `${timingHtml}<details class="index-report"><summary>Index report: what was not read</summary>
+  if (versions.length) {
+    const describe = (f) => [f.version && `version ${f.version}`,
+      f.date && `dated ${f.date} (${f.date_source})`, !f.date && f.file_date && `file date ${f.file_date}`]
+      .filter(Boolean).join(", ");
+    sections.push(`<p><b>Possibly versions of the same document (${versions.length})</b>
+      <span class="muted">- oldest to newest; answers are told to show both when they differ</span></p>
+      <ul>${versions.map((g) => `<li>${g.files.map((f) =>
+        `${esc(f.file)}${describe(f) ? ` <span class="muted">(${esc(describe(f))})</span>` : ""}`).join("<br>")}
+        <div class="source-location">apparent newest: ${esc(g.newest)} - ${esc(g.why)}</div></li>`).join("")}</ul>`);
+  }
+  if (supersedes.length) {
+    sections.push(`<p><b>Documents that say they supersede or cancel others</b></p>
+      ${list(supersedes.map((s) => `${s.file}: "${s.text}"`))}`);
+  }
+  return `${timingHtml}<details class="index-report"><summary>Index report: what was not read, and possible versions</summary>
     ${sections.join("")}</details>`;
 }
 

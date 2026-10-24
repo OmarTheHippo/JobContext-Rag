@@ -25,6 +25,21 @@ version of [JobContext](https://github.com/OmarTheHippo/JobContext).
   model runs about twice as fast as Chroma's default with identical vectors. Measured
   on a 297-file test folder (16-core PC): first index 65 s (was ~140 s), re-index with
   nothing changed 1.4 s.
+- **Document versions, in every layer.** Folders often hold several versions of a
+  document (estimates, scopes, a policy and its changes). Each passage sent to the model
+  carries its document's version and date and where each came from, for example
+  `IGCE_v2_FINAL.xlsx | version v2 FINAL (file name) | dated 2025-03-14 (first page)`.
+  This is worked out at indexing with no API calls: version from the file name or a
+  labelled line ("Revision", "Change 2"); date from a labelled line ("Date:",
+  "Effective") or a date alone near the top of the first page, an email's sent date, the
+  date saved in the file's properties, or else the file date. Dates cited inside a
+  sentence are ignored, and nothing is shown when nothing reliable is found. When
+  sources disagree on the same item, answers show each with its version and date and
+  say which looks current and why. The index report lists files that look like versions
+  of one document (same name once version and date markers are removed, or the same
+  long first-page title), oldest to newest, and documents that say they supersede or
+  cancel another. Heuristic: a series such as dated meeting minutes can show up as a
+  "possible versions" group; the report is information only and doesn't change answers.
 - **Search by meaning and by keyword.** Each search combines a meaning-based (vector)
   search with exact keyword matching (BM25), so a project number, form or drawing
   number or acronym mentioned once in a long document is still found. Only words that

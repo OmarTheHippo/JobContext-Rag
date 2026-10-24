@@ -1618,6 +1618,269 @@ def _clear_extracted_sources(kind: str, layer_id: str) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Document dates, versions and possible versions of the same document
+# -----------------------------------------------------------------------------
+# Folders often hold several versions of one document (estimates, scopes, policies and
+# their changes). Each passage's label therefore carries the document's version and
+# best date, and where each came from, so the model can tell old from new; the index
+# report lists files that look like versions of each other. All of it is worked out at
+# indexing time from the file itself - no API calls. It is heuristic: when nothing
+# reliable is found the label says nothing rather than guess.
+
+_MONTHS = {name: number for number, names in enumerate((
+    ("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"),
+    ("may",), ("jun", "june"), ("jul", "july"), ("aug", "august"),
+    ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"),
+    ("dec", "december")), start=1) for name in names}
+_MONTH = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?"
+_DATE_PATTERNS = [
+    (re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"), "ymd"),
+    (re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})\b"), "mdy"),           # US style
+    (re.compile(r"\b(\d{1,2})\s+" + _MONTH + r",?\s+(\d{4}|\d{2})\b", re.I), "dMy"),
+    (re.compile(r"\b" + _MONTH + r"\s+(\d{1,2}),?\s+(\d{4})\b", re.I), "Mdy"),
+    (re.compile(r"\b" + _MONTH + r",?\s+(\d{4})\b", re.I), "My"),
+]
+# Lines that state the document's own date ("Date: ...", "Effective 1 Oct 2024"). Only
+# at the start of a line, so "IAW DLAI 1234 dated 2015" inside a sentence doesn't count.
+_DATE_LINE = re.compile(
+    r"^\s*(?:document\s+|issue\s+|revision\s+|rev\.?\s+|effective\s+|publication\s+)?"
+    r"(?:date[d]?|effective|issued|as\s+of|sent|prepared|signed|updated)\b\s*(?:on)?\s*[:\-]?\s*(.{4,60})",
+    re.I | re.M)
+_VERSION_LINE = re.compile(
+    r"^\s*(revision|rev\.?|version|ver\.?|change|chg\.?|amendment|edition)\s*(?:no\.?|number|#)?"
+    r"\s*[:\-]?\s*([a-z]?\d+(?:\.\d+)*|[a-z])\b", re.I | re.M)
+_VERSION_ANYWHERE = re.compile(r"\b(change|amendment)\s+(\d+)\b", re.I)
+_NAME_VERSION = re.compile(
+    r"(?:^|[\s_\-.(])((?:v|ver|version)\s*\d+(?:\.\d+)*|rev(?:ision)?\s*[a-z0-9]{1,3}|r\d{1,2}"
+    r"|change\s*\d+|chg\s*\d+|amend(?:ment)?\s*\d+|final|draft|signed)(?=$|[\s_\-.)])", re.I)
+_SUPERSEDES = re.compile(r"\b(supersedes|cancels|rescinds|replaces)\b\s*:?\s*((?:[^\n.;]|\.(?=\d)){4,140})",
+                         re.I)
+
+
+def _month(name: str) -> int:
+    name = name.lower().rstrip(".")
+    return _MONTHS.get(name) or _MONTHS[name[:3]]
+
+
+def _parse_date(text: str) -> str:
+    """First date in text as YYYY-MM-DD (or YYYY-MM), else ''."""
+    for pattern, order in _DATE_PATTERNS:
+        for match in pattern.finditer(text or ""):
+            groups = match.groups()
+            try:
+                if order == "ymd":
+                    year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+                elif order == "mdy":
+                    month, day, year = int(groups[0]), int(groups[1]), int(groups[2])
+                elif order == "dMy":
+                    day, month, year = int(groups[0]), _month(groups[1]), int(groups[2])
+                elif order == "Mdy":
+                    month, day, year = _month(groups[0]), int(groups[1]), int(groups[2])
+                else:
+                    month, day, year = _month(groups[0]), 0, int(groups[1])
+            except (KeyError, ValueError):
+                continue
+            if year < 100:
+                year += 2000 if year < 70 else 1900
+            if 1950 <= year <= 2100 and 1 <= month <= 12 and 0 <= day <= 31:
+                return f"{year:04d}-{month:02d}" + (f"-{day:02d}" if day else "")
+    return ""
+
+
+def _first_page_text(units: list[dict]) -> str:
+    return ((units[0].get("text") if units else "") or "")[:4000]
+
+
+def _properties_date(path: Path) -> str:
+    """The 'last saved' date inside the file itself (PDF, Word, Excel, PowerPoint)."""
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".pdf" and PdfReader is not None:
+            meta = PdfReader(str(path)).metadata or {}
+            when = getattr(meta, "modification_date", None) or getattr(meta, "creation_date", None)
+        elif suffix == ".docx" and Document is not None:
+            when = Document(str(path)).core_properties.modified
+        elif suffix == ".pptx" and Presentation is not None:
+            when = Presentation(str(path)).core_properties.modified
+        elif suffix in (".xlsx", ".xlsm") and load_workbook is not None:
+            book = load_workbook(str(path), read_only=True)
+            try:
+                when = book.properties.modified
+            finally:
+                book.close()
+        else:
+            return ""
+        return when.strftime("%Y-%m-%d") if when else ""
+    except Exception:                             # noqa: BLE001  (encrypted, damaged, ...)
+        return ""
+
+
+def document_dates(path: Path, units: list[dict], file_date: str) -> dict:
+    """
+    {"version", "version_source", "date", "date_source", "file_date", "supersedes"} for
+    one file. The date is the document's own (a labelled line or a date alone on a line
+    near the top of the first page, or an email's sent date), else the date saved in
+    the file's properties, else the file system date.
+    """
+    first = _first_page_text(units)
+    found = {"version": "", "version_source": "", "date": "", "date_source": "",
+             "file_date": file_date, "supersedes": []}
+
+    name_version = _NAME_VERSION.findall(path.stem.replace("_", " "))
+    if name_version:
+        found.update(version=" ".join(v.strip() for v in name_version)[:40],
+                     version_source="file name")
+    else:
+        line = _VERSION_LINE.search(first)
+        anywhere = _VERSION_ANYWHERE.search("\n".join(first.splitlines()[:10]))
+        if line:
+            found.update(version=f"{line.group(1).rstrip('.').capitalize()} {line.group(2)}",
+                         version_source="first page")
+        elif anywhere:
+            found.update(version=f"{anywhere.group(1).capitalize()} {anywhere.group(2)}",
+                         version_source="first page")
+
+    for line in _DATE_LINE.finditer(first):
+        date = _parse_date(line.group(1))
+        if date:
+            source = "email" if path.suffix.lower() in (".msg", ".eml") else "first page"
+            found.update(date=date, date_source=source)
+            break
+    if not found["date"]:
+        # A date alone on a line near the top (memo style).
+        for line in first.splitlines()[:15]:
+            date = _parse_date(line)
+            if date and len(line.strip()) <= 30:
+                found.update(date=date, date_source="first page")
+                break
+    if not found["date"]:
+        saved = _properties_date(path)
+        if saved:
+            found.update(date=saved, date_source="saved, file properties")
+
+    found["supersedes"] = [f"{verb.lower()} {what.strip()}" for verb, what in
+                           _SUPERSEDES.findall(first)][:3]
+    return found
+
+
+def _dates_label(meta: dict) -> str:
+    """The version and date part of a passage's source label ('' if none)."""
+    parts = []
+    if meta.get("version"):
+        parts.append(f"version {meta['version']} ({meta.get('version_source', '')})")
+    if meta.get("doc_date"):
+        parts.append(f"dated {meta['doc_date']} ({meta.get('doc_date_source', '')})")
+    elif meta.get("file_date"):
+        parts.append(f"file date {meta['file_date']}")
+    return " | ".join(parts)
+
+
+def _chunk_date_metadata(dates: dict) -> dict:
+    return {"version": dates.get("version", ""), "version_source": dates.get("version_source", ""),
+            "doc_date": dates.get("date", ""), "doc_date_source": dates.get("date_source", ""),
+            "file_date": dates.get("file_date", "")}
+
+
+_VERSION_WORDS = re.compile(
+    r"\b(?:v|ver|version)\s*\d+(?:\.\d+)*\b|\brev(?:ision)?\s*[a-z0-9]{1,3}\b|\br\d{1,2}\b"
+    r"|\b(?:change|chg|amend(?:ment)?)\s*\d+\b|\b(?:final|draft|signed|updated|revised|"
+    r"old|new|current|copy|latest)\b|\(\d+\)|\b(?:19|20)\d{2}(?:[-.]?\d{2}){0,2}\b"
+    r"|\b\d{6,8}\b|\b\d{1,2}[-.]\d{1,2}[-.]\d{2,4}\b", re.I)
+
+
+_NAME_DATES = re.compile(r"(?:19|20)\d{2}[-_. ]?\d{1,2}[-_. ]?\d{1,2}"
+                         r"|\d{1,2}[-_.]\d{1,2}[-_.](?:19|20)?\d{2}|\b\d{6,8}\b")
+
+
+def _version_key(text: str) -> str:
+    """A file name or title with version and date markers removed, for grouping."""
+    key = _NAME_DATES.sub(" ", text.lower())         # dates first, while still joined
+    key = _VERSION_WORDS.sub(" ", re.sub(r"[_\-.]+", " ", key))
+    return " ".join(re.findall(r"[a-z0-9]+", key))
+
+
+def _version_rank(version: str) -> tuple:
+    """Rough order of version labels: draft < unlabelled < numbered/lettered < final."""
+    text = (version or "").lower()
+    if "draft" in text:
+        return (0, 0.0)
+    number = re.search(r"(\d+(?:\.\d+)?)", text)
+    letter = re.search(r"\brev(?:ision)?\s*([a-z])\b", text)
+    if number:
+        return (2, float(number.group(1).split(".")[0]) + (float("0." + number.group(1).split(".")[1])
+                                                            if "." in number.group(1) else 0.0))
+    if letter:
+        return (2, float(ord(letter.group(1)) - 96))
+    if "final" in text or "signed" in text:
+        return (3, 0.0)
+    return (1, 0.0)
+
+
+def find_version_groups(records: list[dict]) -> list[dict]:
+    """
+    Files in one layer that look like versions of the same document: the same name
+    once version and date markers are removed (IGCE_v1.xlsx / IGCE_v2_final.xlsx), or
+    the same long first-page title. Each group lists its files oldest to newest by the
+    best evidence available, and names the apparent newest with the reason.
+    """
+    keys: dict[str, list[int]] = {}
+    for number, record in enumerate(records):
+        name_key = _version_key(Path(record.get("file_name", "")).stem)
+        if len(name_key) >= 3:
+            keys.setdefault("name:" + name_key + Path(record.get("file_name", "")).suffix.lower(),
+                            []).append(number)
+        units = record.get("units") or []
+        title = next((line.strip() for line in _first_page_text(units).splitlines()
+                      if line.strip()), "")
+        title_key = _version_key(title)
+        if len(title_key.split()) >= 6:
+            keys.setdefault("title:" + title_key, []).append(number)
+
+    parent = list(range(len(records)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for members in keys.values():
+        for other in members[1:]:
+            parent[root(other)] = root(members[0])
+    clusters: dict[int, list[int]] = {}
+    for number in range(len(records)):
+        clusters.setdefault(root(number), []).append(number)
+
+    groups = []
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        files = []
+        for number in members:
+            record = records[number]
+            dates = record.get("dates") or {}
+            files.append({"file": record.get("relative_path", ""),
+                          "version": dates.get("version", ""),
+                          "date": dates.get("date", ""), "date_source": dates.get("date_source", ""),
+                          "file_date": dates.get("file_date", "")})
+        own = [f for f in files if f["date"] and "properties" not in f["date_source"]]
+        if len(own) == len(files) and len({f["date"] for f in files}) > 1:
+            files.sort(key=lambda f: f["date"])
+            why = "latest document date"
+        elif len({_version_rank(f["version"]) for f in files}) > 1:
+            files.sort(key=lambda f: _version_rank(f["version"]))
+            why = "highest version label"
+        elif any(f["date"] for f in files) and len({f["date"] for f in files}) > 1:
+            files.sort(key=lambda f: f["date"] or "")
+            why = "latest date saved in the files (less reliable)"
+        else:
+            files.sort(key=lambda f: f["file_date"] or "")
+            why = "latest file date (least reliable: copying can change it)"
+        groups.append({"files": files, "newest": files[-1]["file"], "why": why})
+    return sorted(groups, key=lambda g: g["newest"].lower())
+
+
+# -----------------------------------------------------------------------------
 # Indexing
 # -----------------------------------------------------------------------------
 
@@ -1680,6 +1943,27 @@ def _validate_folder(path: str | Path) -> Path:
 
 # At most this many names are kept per unsupported type in the index report.
 REPORT_NAMES_PER_TYPE = 50
+
+
+def _file_date(path: Path) -> str:
+    return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+
+
+def _add_dates(collection, kind: str, layer_id: str, folder: Path, record: dict) -> None:
+    """Add dates to an unchanged file indexed by an older version: its extracted record
+    and its passages' metadata are updated in place, without reading or re-embedding."""
+    path = folder / record["relative_path"]
+    try:
+        dates = document_dates(path, record.get("units") or [], _file_date(path))
+    except Exception:                             # noqa: BLE001
+        return
+    record["dates"] = dates
+    _write_extracted_source(kind, layer_id, record["source_key"], record)
+    stored = collection.get(where={"source_key": record["source_key"]}, include=["metadatas"])
+    if stored.get("ids"):
+        collection.update(ids=stored["ids"],
+                          metadatas=[{**(meta or {}), **_chunk_date_metadata(dates)}
+                                     for meta in stored["metadatas"]])
 
 
 def index_layer(kind: str,
@@ -1755,6 +2039,10 @@ def index_layer(kind: str,
                 collection.delete(where={"source_key": source_key})
                 (_source_dir(kind, layer_id) / f"{source_key}.json").unlink(missing_ok=True)
 
+        for record in unchanged:
+            if "dates" not in record:
+                _add_dates(collection, kind, layer_id, folder, record)
+
         indexed_files = len(unchanged)
         indexed_chunks = sum(int(record.get("chunk_count") or 0) for record in unchanged)
         failures, warnings = [], []
@@ -1797,12 +2085,14 @@ def index_layer(kind: str,
                 report()
                 file_warnings: list[str] = []
                 began = time.perf_counter()
+                dates = {}
                 try:
                     outcome = extract_document(file_path, warnings=file_warnings, progress=report)
+                    dates = document_dates(file_path, outcome, _file_date(file_path))
                 except Exception as exc:              # noqa: BLE001
                     outcome = exc
                 results.put((file_path, relative_path, outcome, file_warnings,
-                             time.perf_counter() - began))
+                             time.perf_counter() - began, dates))
             results.put(None)
 
         thread = threading.Thread(target=reader, name="index-reader", daemon=True)
@@ -1812,7 +2102,7 @@ def index_layer(kind: str,
             item = results.get()
             if item is None:
                 break
-            file_path, relative_path, outcome, file_warnings, seconds = item
+            file_path, relative_path, outcome, file_warnings, seconds, dates = item
             read_times.append((seconds, relative_path))
 
             if isinstance(outcome, Exception):
@@ -1846,8 +2136,10 @@ def index_layer(kind: str,
                 "chunk_count": len(chunks),
                 # A file read only in part is read again next time (e.g. once OCR works).
                 "warnings": file_warnings,
+                "dates": dates,
                 "units": text_units,
             })
+            date_metadata = _chunk_date_metadata(dates)
 
             for sequence, chunk in enumerate(chunks):
                 ids.append(f"{source_key}__{sequence}")
@@ -1866,6 +2158,7 @@ def index_layer(kind: str,
                     "row_end": str(chunk["row_end"] or ""),
                     "modified": str(stamp["modified"]),
                     "sequence": sequence,
+                    **date_metadata,
                 })
                 if len(ids) >= 160:          # 8 API batches of 20, run in parallel
                     flush()
@@ -1884,6 +2177,11 @@ def index_layer(kind: str,
     if images_without_text:
         warnings.append(f"{images_without_text} image(s) had no readable text "
                         "(photos, drawings without text) and were skipped")
+
+    records = _read_extracted_sources(kind, layer_id)
+    versions = find_version_groups(records)
+    supersedes = [{"file": record.get("relative_path", ""), "text": text}
+                  for record in records for text in (record.get("dates") or {}).get("supersedes", [])]
 
     total = time.perf_counter() - started
     timings = {
@@ -1917,6 +2215,8 @@ def index_layer(kind: str,
         "failed": failures,
         "warnings": warnings,
         "timings": timings,
+        "versions": versions,
+        "supersedes": supersedes,
         "unsupported": {
             suffix: {"count": len(names), "hint": _missing_type_hint(suffix),
                      "files": sorted(names)[:REPORT_NAMES_PER_TYPE]}
@@ -1982,7 +2282,8 @@ def _source_label(record: dict) -> str:
     kind = _layer_label(record.get("kind", ""))
     file_name = meta.get("file_name", "Unknown file")
     location = meta.get("location", "document text")
-    return f"{kind}: {layer_name} | {file_name} | {location}"
+    dates = _dates_label(meta)
+    return f"{kind}: {layer_name} | {file_name} | {location}" + (f" | {dates}" if dates else "")
 
 
 def _query_layer(kind: str,
@@ -2523,9 +2824,10 @@ def retrieve_all(chat: dict,
                     continue
 
                 location = unit.get("location", "document text")
+                dates = _dates_label(_chunk_date_metadata(source.get("dates") or {}))
                 block = (
                     f"[Source: {_layer_label(kind)}: {layer['name']} | "
-                    f"{file_name} | {location}]\n{text}"
+                    f"{file_name} | {location}{' | ' + dates if dates else ''}]\n{text}"
                 )
                 block_tokens = _estimate_tokens(block)
 
