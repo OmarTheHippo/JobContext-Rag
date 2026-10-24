@@ -1,9 +1,10 @@
 @echo off
 rem Job-Context Client (RAG) installer. Put this file next to jobcontext.txt,
-rem jobcontext_rag.py and requirements-rag.txt, then double-click it. No admin rights.
+rem jobcontext_rag.py, requirements.txt and requirements-optional.txt, then
+rem double-click it. No admin rights.
 cd /d "%~dp0"
 
-for %%F in (jobcontext.txt jobcontext_rag.py requirements-rag.txt) do (
+for %%F in (jobcontext.txt jobcontext_rag.py requirements.txt) do (
   if not exist %%F (
     echo %%F must be in the same folder as install.bat.
     pause
@@ -20,7 +21,7 @@ if not defined PY python3 -c "import sys" >nul 2>nul && set "PY=python3"
 if not defined PY (
   echo Couldn't start Python with "py", "python" or "python3" from this window.
   echo If one of them works in your own terminal, open that terminal in this folder and run:
-  echo     py -m pip install -r requirements-rag.txt
+  echo     py -m pip install -r requirements.txt
   echo     py jobcontext.txt --install
   pause
   exit /b 1
@@ -35,22 +36,25 @@ if errorlevel 1 (
 )
 echo Using: %PY%
 
-rem Packages: document search (Chroma, PDF/Word/Excel readers) and the openai
-rem library used to call the API. Installed once.
+rem Core packages (the app needs these): document search (Chroma, PDF/Word/Excel
+rem readers) and the openai library used to call the API. Installed once.
 %PY% -c "import chromadb, pypdf, docx, openpyxl, openai" >nul 2>nul
 if errorlevel 1 (
-  echo Installing document-search packages from requirements-rag.txt...
-  %PY% -m pip install -r requirements-rag.txt
+  echo Installing core packages from requirements.txt...
+  %PY% -m pip install -r requirements.txt
   if errorlevel 1 (
     echo Package installation failed. Check your network or package mirror, then run:
-    echo     %PY% -m pip install -r requirements-rag.txt
+    echo     %PY% -m pip install -r requirements.txt
     pause
     exit /b 1
   )
 ) else (
-  echo Document-search packages already installed.
+  echo Core packages already installed.
 )
 
+rem Then the app's own setup. It also installs each optional group from
+rem requirements-optional.txt on its own (PowerPoint, old Excel, Outlook email,
+rem encrypted PDFs, OCR) and shows a summary of what did and didn't install.
 %PY% jobcontext.txt --install
 echo.
 pause

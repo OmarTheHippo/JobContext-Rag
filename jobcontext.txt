@@ -35,6 +35,7 @@ import random
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -50,7 +51,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.6.1"
+APP_VERSION = "3.7.0"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -80,6 +81,7 @@ RAG_FOLLOWUP_ENABLED = os.environ.get("JOBCTX_RAG_FOLLOWUP", "0") == "1"
 # Planner limits, so one question can't turn into dozens of searches.
 PLANNER_MAX_NEEDS = 8
 PLANNER_MAX_QUERIES_PER_NEED = 4
+PLANNER_MAX_KEYWORDS_PER_NEED = 5
 # How much of each layer prompt (including a project's brief), and of the recent
 # conversation, the planner sees.
 PLANNER_LAYER_PROMPT_CHARS = 16000
@@ -137,6 +139,19 @@ Rules:
 - For monetary facts, consider variants such as cost, estimate, amount,
   budget, programmed amount, IGE, IGCE, independent government estimate and
   negotiated price.
+- For project details, scope of work or technical specifications, one search
+  is not enough. Vary the searches so they cover:
+  (1) the high-level concept ("scope of work for the fuel tank replacement");
+  (2) identifier wording: generic labels such as project, project number, ID,
+      code, FY, contract number, plus the identifier itself;
+  (3) the specific nouns and materials in the question or evidence ("PVC
+      piping", "underground storage tank").
+- Optional "keywords": exact strings that must match literally - project
+  numbers, form, drawing or contract numbers, acronyms, part or material names
+  (for example "P664", "DD 1391", "PVC"). Copy them as written in the question,
+  conversation or brief. Use 1-5 per need; leave it out when there is none.
+  Documents often mention such an identifier only once, which a meaning-based
+  search can miss; keywords are matched word for word.
 - At most 8 needs.
 - Optional "files": when a brief's document inventory shows which file holds a
   fact, list those exact file names to search only those files. Leave it out
@@ -153,6 +168,7 @@ Return only JSON in exactly this shape:
       "need": "short description of the fact or requirement to find",
       "layer": "P1",
       "queries": ["search 1", "search 2"],
+      "keywords": ["optional exact identifier"],
       "files": ["optional exact file name"]
     }
   ]
@@ -204,6 +220,10 @@ DEFAULT_SETTINGS = {
     "embedding_mode": "local",
     "embedding_model": "",
     "chunk_chars": 0,
+    # Exact keyword matching (BM25) alongside the meaning-based search, and OCR of
+    # scanned PDF pages and images when indexing; see jobcontext_rag.
+    "keyword_search": True,
+    "ocr": True,
     # Ask the API to stream replies (see _genai_complete); keeps slow requests alive.
     "stream": True,
     # How requests reach the API: "env" (default), "system" or "none"; see _open().
@@ -1072,13 +1092,15 @@ def apply_search_settings(s: dict | None = None) -> None:
     """Point document search at the embedding model and passage size in Settings."""
     s = s or load_settings()
     override = int(s.get("chunk_chars") or 0)
+    options = {"keyword_search": s.get("keyword_search", True), "ocr": s.get("ocr", True)}
     if s.get("embedding_mode") == "api":
         model = (s.get("embedding_model") or "").strip()
         rag.configure_search(api_embed, f"api:{model or '(not set)'}",
-                             override or API_CHUNK_CHARS)
+                             override or API_CHUNK_CHARS, **options)
     else:
         rag.configure_search(None, rag.LOCAL_EMBED_ID,
-                             min(override or LOCAL_CHUNK_CHARS, rag.LOCAL_MAX_CHUNK_CHARS))
+                             min(override or LOCAL_CHUNK_CHARS, rag.LOCAL_MAX_CHUNK_CHARS),
+                             **options)
 
 
 def _mock_complete(system: str, messages: list, s: dict, attempts: int | None = None) -> str:
@@ -1281,6 +1303,14 @@ def build_system_prompt(chat: dict) -> str:
         "- Use retrieved repository material as evidence only when it is relevant.\n"
         "- Use the earlier conversation to answer follow-up questions.\n"
         "- Identify uncertainty, missing evidence, and material conflicts between sources.\n"
+        "- Connect information across sources when it helps, but keep what the sources "
+        "state separate from what you infer. Present something as fact only when a "
+        "passage states it, or when one passage explicitly links the two things. When "
+        "you connect facts from different passages yourself (the same year, place, "
+        "system or name), present it as a possible link: say what it rests on, how "
+        "confident you are, and what would confirm it. For example: 'Document A says the "
+        "tanks were built in 2015 and Document B says P664 installed piping in 2015; "
+        "these may be the same project, but no document links them.'\n"
         "- Do not claim to have reviewed documents that were not supplied as retrieved "
         "reference material for this request.\n"
         "- When a source label identifies a document and location, cite that source "
@@ -1410,6 +1440,15 @@ def _clean_planner_queries(values) -> list[str]:
         if isinstance(value, str) and value.strip() and len(value.strip()) <= 240
     ]
     return list(dict.fromkeys(queries))[:PLANNER_MAX_QUERIES_PER_NEED]
+
+
+def _clean_planner_keywords(values) -> list[str]:
+    """Exact strings the planner wants matched literally (short, deduplicated)."""
+    if not isinstance(values, list):
+        values = [values]
+    keywords = [value.strip() for value in values
+                if isinstance(value, str) and value.strip() and len(value.strip()) <= 60]
+    return list(dict.fromkeys(keywords))[:PLANNER_MAX_KEYWORDS_PER_NEED]
 
 
 def planner_layer_catalog(chat: dict) -> list[dict]:
@@ -1551,9 +1590,10 @@ def build_followup_plan(chat: dict, question: str, initial: dict) -> dict:
 
         ref = str(entry.get("layer") or "").strip()
         target = by_id.get(ref.upper()) or by_name.get(ref.lower())
-        # A need without a usable layer falls back to every searchable Project,
-        # which matches how the planner behaved before it could target layers.
-        targets = [target] if target else projects
+        # A need without a usable layer falls back to every searchable Project
+        # (how the planner behaved before it could target layers), or to every
+        # searchable layer when no Project is selected.
+        targets = [target] if target else (projects or searchable)
 
         files = entry.get("files") if isinstance(entry.get("files"), list) else []
         files = [f.strip() for f in files if isinstance(f, str) and f.strip()][:10]
@@ -1566,6 +1606,7 @@ def build_followup_plan(chat: dict, question: str, initial: dict) -> dict:
                 "layer_id": layer["layer_id"],
                 "layer_label": f"{layer['id']} - {KIND_LABELS[layer['kind']]}: {layer['name']}",
                 "queries": queries,
+                "keywords": _clean_planner_keywords(entry.get("keywords", [])),
                 "files": files,
             })
 
@@ -1679,7 +1720,10 @@ def build_update_request(layer: dict, kind: str, chat: dict, instruction: str) -
 CARD_SYSTEM = """\
 You read one project document and write a short, factual file card for it. The card
 is used to build a project brief and to decide which file to search later. Use only
-what the document says; never infer or invent.
+what the document says; never infer or invent. Record a link between two things (for
+example, that some work belongs to a named project) only when the document states it.
+For an email, record the sender, recipients, date, and what was decided, requested or
+agreed, and list its attachments.
 
 What matters to this user (organisation guidance):
 <<GUIDANCE>>
@@ -1706,6 +1750,10 @@ Rules:
 - If something isn't covered, write "not found in the project files" - never
   "missing" or "not required", because the folder may be incomplete.
 - Put the source file in square brackets after each fact, e.g. [Cost_Estimate.xlsx].
+- State a link between files (for example, that work described in one file is the
+  same project or item as in another) only when a card states that link. A link you
+  only suspect (same year, place or system) goes under Gaps as a possible link to
+  confirm, with the files it rests on.
 - When files disagree (cost, dates, scope, classification), list every value with
   its source under Conflicts. Do not pick one.
 - Be concise: aim for under about 800 words plus the tables.
@@ -2096,6 +2144,9 @@ def get_settings(body, query):
             "embeddings_endpoint": _embeddings_endpoint(s),
             "chunk_chars": s.get("chunk_chars") or 0,
             "chunk_chars_effective": rag.CHUNK_CHARS,
+            "keyword_search": s.get("keyword_search", True),
+            "ocr": s.get("ocr", True),
+            "file_types": rag.file_type_support(),
             "stream": s.get("stream", True),
             "proxy_mode": s.get("proxy_mode", "env"),
             "api_client": s.get("api_client", "auto"),
@@ -2146,6 +2197,9 @@ def set_settings(body, query):
         s["brief_guidance"] = str(body["brief_guidance"]).strip()
     if "stream" in body:
         s["stream"] = bool(body["stream"])
+    for flag in ("keyword_search", "ocr"):
+        if flag in body:
+            s[flag] = bool(body[flag])
     if body.get("proxy_mode") in PROXY_MODES:
         s["proxy_mode"] = body["proxy_mode"]
     if body.get("api_client") in API_CLIENTS:
@@ -2288,6 +2342,8 @@ def run_index(kind: str, item_id: str, path: str, progress=None) -> dict:
         "status": result["status"],
         "error": "",
         "failed": result.get("failed", []),
+        "warnings": result.get("warnings", []),
+        "unsupported": result.get("unsupported", {}),
     })
     layer["repository"] = repository
     layer["updated"] = time.time()
@@ -3066,6 +3122,9 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   border-color: #9ecb9e;
 }
 
+.chip.match { margin-left: 6px; font-size: 11px; padding: 0 7px; }
+.index-report { margin-top: 8px; }
+.index-report ul { margin: 4px 0 8px 18px; padding: 0; }
 .chip.mode {
   background: var(--code);
   color: var(--muted);
@@ -3327,6 +3386,11 @@ PAGE_HTML = r"""<!doctype html>
         placeholder="automatic (800 local, 3,000 API)"></label>
     <label class="field">Simultaneous API requests (briefs and indexing)
       <input id="set-parallel" type="number" min="1" max="8" step="1"></label>
+    <label><input id="set-keyword" type="checkbox"> Keyword matching: also find exact
+      project numbers, form or drawing numbers and acronyms (no re-index needed)</label>
+    <label><input id="set-ocr" type="checkbox"> Read scanned PDF pages and images with OCR
+      when indexing</label>
+    <div class="small muted" id="set-file-types"></div>
     <div class="small muted">Changing the embedding model or passage size requires
       re-indexing each folder; the editor flags folders indexed with other settings.</div>
     <div class="small muted" id="set-data-dir"></div>
@@ -3528,6 +3592,9 @@ async function openSettings() {
   $("#set-embed-mode").value = s.embedding_mode || "local";
   $("#set-embed-model").value = s.embedding_model || "";
   $("#set-chunk").value = s.chunk_chars || "";
+  $("#set-keyword").checked = s.keyword_search !== false;
+  $("#set-ocr").checked = s.ocr !== false;
+  $("#set-file-types").innerHTML = fileTypesHtml(s.file_types || []);
   $("#set-embed-endpoint").textContent = s.embeddings_endpoint
     ? `Embedding requests go to: ${s.embeddings_endpoint}` : "";
   const syncEmbed = () => { $("#embed-api-fields").hidden = $("#set-embed-mode").value !== "api"; };
@@ -3579,6 +3646,7 @@ async function saveSettings(extra = {}) {
     parallel_requests: $("#set-parallel").value, card_tokens: $("#set-card-tokens").value,
     embedding_mode: $("#set-embed-mode").value, embedding_model: $("#set-embed-model").value,
     chunk_chars: $("#set-chunk").value,
+    keyword_search: $("#set-keyword").checked, ocr: $("#set-ocr").checked,
     stream: $("#set-stream").checked, proxy_mode: $("#set-proxy").value,
     api_client: $("#set-client").value, message_format: $("#set-format").value,
     limit_param: $("#set-limit-param").value,
@@ -3741,12 +3809,6 @@ async function openPicker(mode) {
   }
 
   document
-    .querySelectorAll('input[name="project"]')
-    .forEach((input) => {
-      input.onchange = syncFollowupPicker;
-    });
-
-  document
     .querySelectorAll('input[name="rag-mode"]')
     .forEach((input) => {
       input.onchange = syncFollowupPicker;
@@ -3789,7 +3851,6 @@ $("#btn-layers-ok").onclick = async () => {
       followup_enabled: Boolean(
         followupBox
         && followupBox.checked
-        && projectIds.length
         && ragMode === "hybrid"
       ),
     };
@@ -3990,6 +4051,12 @@ function sourceRows(sources) {
         <li>
           <span class="source-layer">${esc(kind)}</span>
           <span class="source-file"> — ${esc(file)}</span>
+          ${source.match === "keyword" || source.match === "both"
+            ? `<span class="chip match" title="Found by exact keyword match${
+                (source.keyword_terms || []).length
+                  ? ": " + esc(source.keyword_terms.join(", ")) : ""}">${
+                source.match === "both" ? "keyword + meaning" : "keyword"}</span>`
+            : ""}
           ${location
             ? `<div class="source-location">${esc(location)}</div>`
             : ""}
@@ -4083,6 +4150,10 @@ function plannerPanel(planner) {
                   ? `<div class="source-location">${
                       queries.map((query) => `<code>${esc(query)}</code>`).join(" · ")
                     }</div>`
+                  : ""}
+                ${(item.keywords || []).length
+                  ? `<div class="source-location">exact keywords: ${
+                      item.keywords.map((k) => `<code>${esc(k)}</code>`).join(" · ")}</div>`
                   : ""}
                 ${(item.files || []).length
                   ? `<div class="source-location">aimed at: ${esc(item.files.join(", "))}</div>`
@@ -4452,6 +4523,54 @@ function renderLibList() {
   }
 }
 
+// --- index report ---------------------------------------------------------------------
+// What indexing did not read, and why: files that failed, files read only in part
+// (e.g. scanned pages without OCR) and file types that aren't read (with what to do).
+function indexProblemsText(repo) {
+  const failed = (repo.failed || []).length;
+  const partial = (repo.warnings || []).length;
+  const skipped = Object.values(repo.unsupported || {})
+    .reduce((sum, group) => sum + (group.count || 0), 0);
+  const parts = [];
+  if (failed) parts.push(`${failed} file(s) could not be read`);
+  if (partial) parts.push(`${partial} note(s) on files read in part`);
+  if (skipped) parts.push(`${skipped} file(s) of types that aren't read`);
+  return parts.length ? parts.join(", ") + " (see the index report below)." : "";
+}
+
+function indexReportHtml(repo) {
+  const failed = repo.failed || [];
+  const warnings = repo.warnings || [];
+  const unsupported = Object.entries(repo.unsupported || {});
+  if (!failed.length && !warnings.length && !unsupported.length) return "";
+  const list = (items) => `<ul>${items.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`;
+  const sections = [];
+  if (failed.length) {
+    sections.push(`<p><b>Could not be read (${failed.length})</b></p>${list(failed)}`);
+  }
+  if (warnings.length) {
+    sections.push(`<p><b>Read in part (${warnings.length})</b></p>${list(warnings)}`);
+  }
+  if (unsupported.length) {
+    sections.push(`<p><b>File types not read</b></p><ul>${unsupported.map(([suffix, group]) => `
+      <li><b>${esc(suffix)}</b> (${group.count}): ${esc(group.hint || "")}
+        <div class="source-location">${esc((group.files || []).join(", "))}${
+          group.count > (group.files || []).length ? ", …" : ""}</div></li>`).join("")}</ul>`);
+  }
+  return `<details class="index-report"><summary>Index report: what was not read</summary>
+    ${sections.join("")}</details>`;
+}
+
+function fileTypesHtml(types) {
+  if (!types.length) return "";
+  const on = types.filter((t) => t.available).map((t) => t.feature);
+  const off = types.filter((t) => !t.available);
+  return `File types read: ${esc(on.join("; "))}.`
+    + (off.length ? `<br>Not available: ${off.map((t) =>
+        `${esc(t.feature)} (${esc(t.detail || `install ${t.packages}: run install.bat`)})`)
+        .join("; ")}.` : "");
+}
+
 function repositoryStatusText(layer) {
   const repo = layer.repository || {};
 
@@ -4463,9 +4582,7 @@ function repositoryStatusText(layer) {
     ? `Indexed ${when(repo.last_indexed)}.`
     : "Repository has not been indexed.";
 
-  const failures = (repo.failed || []).length
-    ? ` ${repo.failed.length} file(s) could not be indexed.`
-    : "";
+  const failures = indexProblemsText(repo) ? ` ${indexProblemsText(repo)}` : "";
 
   // Indexes built with different chunk settings (or before they were recorded)
   // still work, but search quality only improves after re-indexing.
@@ -4524,10 +4641,9 @@ async function watchIndexing(kind, layerId, quietIfIdle = false) {
   renderLibList();
   renderLibEdit();
   const repo = job.repository || {};
-  const failed = repo.failed || [];
   $("#repo-detail").textContent =
     `Indexed ${repo.file_count} file(s) into ${repo.chunk_count} passages with the ${how}.`
-    + (failed.length ? ` ${failed.length} file(s) were skipped.` : "");
+    + (indexProblemsText(repo) ? ` ${indexProblemsText(repo)}` : "");
   toast(kind === "projects" && repo.file_count
     ? "Indexing complete - generating the project brief"
     : "Indexing complete");
@@ -4672,6 +4788,7 @@ function renderLibEdit() {
       </div>
 
       <div id="repo-detail" class="muted small"></div>
+      <div id="repo-report" class="small">${indexReportHtml(repo)}</div>
     </section>
 
     ${kind === "projects" ? `
@@ -4958,8 +5075,120 @@ You help me think through problems, data, and policy questions.
 - Separate project facts from recommendations.
 """, "A discrete work effort with its own instructions and optional source repository.")
 
-def install():
-    """Creates the data folders and a 'Start Job-Context.bat' next to this file."""
+OPTIONAL_REQUIREMENTS = APP_DIR / "requirements-optional.txt"
+
+# Checks that Windows OCR really works: the packages import AND Windows has an OCR
+# language for this user. Run in a fresh Python so newly installed packages count.
+OCR_CHECK = (
+    "from winrt.windows.media.ocr import OcrEngine\n"
+    "import winrt.windows.foundation.collections, winrt.windows.globalization\n"
+    "engine = OcrEngine.try_create_from_user_profile_languages()\n"
+    "print(', '.join(l.language_tag for l in OcrEngine.available_recognizer_languages))\n"
+    "raise SystemExit(0 if engine else 3)\n"
+)
+
+
+def optional_groups() -> list[dict]:
+    """The groups in requirements-optional.txt: [{name, check: [modules], packages}]."""
+    groups = []
+    if not OPTIONAL_REQUIREMENTS.exists():
+        return groups
+    for line in OPTIONAL_REQUIREMENTS.read_text(encoding="utf-8").splitlines():
+        header = re.match(r"^#\s*==\s*(.+?)\s*==\s*check:\s*(.+)$", line.strip())
+        if header:
+            groups.append({"name": header.group(1),
+                           "check": [m.strip() for m in header.group(2).split(",") if m.strip()],
+                           "packages": []})
+        elif groups and line.strip() and not line.lstrip().startswith("#"):
+            groups[-1]["packages"].append(line.strip())
+    return groups
+
+
+def _run_python(code: str, timeout: int = 120) -> tuple[int, str]:
+    try:
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              timeout=timeout)
+        return done.returncode, (done.stdout + done.stderr).strip()
+    except Exception as exc:                          # noqa: BLE001
+        return 1, str(exc)
+
+
+def _group_works(group: dict) -> tuple[bool, str]:
+    """Whether a group's modules import (and, for OCR, Windows has an OCR language)."""
+    code, output = _run_python("import " + ", ".join(group["check"]))
+    if code:
+        return False, (output.splitlines() or ["import failed"])[-1][:200]
+    if any(module.startswith("winrt") for module in group["check"]):
+        code, output = _run_python(OCR_CHECK)
+        if code == 3:
+            return False, ("packages installed, but Windows has no OCR language for this "
+                           "user (Settings > Time & language > Language & region)")
+        if code:
+            return False, (output.splitlines() or ["Windows OCR check failed"])[-1][:200]
+        return True, f"OCR languages: {output or 'none listed'}"
+    return True, ""
+
+
+def install_optional() -> list[tuple[str, bool, str]]:
+    """Install each optional group on its own; returns [(group, works, detail)]."""
+    results = []
+    for group in optional_groups():
+        works, detail = _group_works(group)
+        if works:
+            print(f"  {group['name']}: already installed")
+            results.append((group["name"], True, detail))
+            continue
+        print(f"  {group['name']}: installing {', '.join(group['packages'])} ...", flush=True)
+        try:
+            done = subprocess.run([sys.executable, "-m", "pip", "install", *group["packages"]],
+                                  capture_output=True, text=True, timeout=900)
+            pip_error = "" if done.returncode == 0 else (
+                [line for line in (done.stdout + done.stderr).splitlines() if line.strip()]
+                or ["pip failed"])[-1][:200]
+        except Exception as exc:                      # noqa: BLE001
+            pip_error = str(exc)[:200]
+        works, detail = _group_works(group)
+        if not works and pip_error:
+            detail = f"pip: {pip_error}"
+        print(f"  {group['name']}: {'OK' if works else 'NOT installed - ' + detail}")
+        results.append((group["name"], works, detail))
+    return results
+
+
+def _show_install_summary(results: list[tuple[str, bool, str]], popup: bool = True) -> None:
+    lines = [f"Job-Context Client {APP_VERSION} is installed.", "",
+             "Core (chat, document search, PDF, Word, Excel): OK", ""]
+    if results:
+        lines.append("Optional file types:")
+        for name, works, detail in results:
+            mark = "OK" if works else "NOT installed"
+            # Plain ASCII: a Windows console with a legacy code page can't print check marks.
+            lines.append(f"  [{'x' if works else ' '}] {name}: {mark}"
+                         + (f" - {detail}" if detail and not works else ""))
+        if not all(works for _, works, _ in results):
+            lines += ["", "The app works without these. Files that need a missing group are",
+                      "listed as \"needs ...\" when you index a folder. Run install.bat again",
+                      "to retry, e.g. on another network."]
+    text = "\n".join(lines)
+    print("\n" + text)
+    if not popup:
+        return
+    try:
+        import tkinter
+        from tkinter import messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        (messagebox.showinfo if all(w for _, w, _ in results) else messagebox.showwarning)(
+            "Job-Context Client - install summary", text, parent=root)
+        root.destroy()
+    except Exception:                                 # noqa: BLE001  (no tkinter or no display)
+        pass
+
+
+def install(optional: bool = True, popup: bool = True):
+    """Creates the data folders and a 'Start Job-Context.bat' next to this file, installs
+    the optional file-type packages and shows what worked."""
     print(f"Installing Job-Context Client {APP_VERSION} in {APP_DIR}\n")
     for k in KINDS + ("chats",):
         _dir(k)
@@ -4979,6 +5208,11 @@ def install():
                        ")\n"
                        "if errorlevel 1 pause\n", encoding="utf-8")
         print(f"\n  Created: {bat.name}  (double-click it to start the app)")
+    results = []
+    if optional:
+        print("\nOptional file types (each installed separately):")
+        results = install_optional()
+    _show_install_summary(results, popup)
     print("\nInstall complete. Your API key is entered in the app under Settings.")
 
 
@@ -5015,7 +5249,7 @@ def serve(port: int, open_browser: bool):
 if __name__ == "__main__":
     args = sys.argv[1:]
     if "--install" in args:
-        install()
+        install(optional="--no-optional" not in args, popup="--no-popup" not in args)
     else:
         port = int(args[args.index("--port") + 1]) if "--port" in args else 5000
         serve(port, open_browser="--no-browser" not in args)

@@ -1,16 +1,7 @@
-# Existing application has no external Python dependencies.
-# Install these from the directory containing jobcontext.txt:
+# Kept for older instructions. The packages are now listed in requirements.txt
+# (core) and requirements-optional.txt (optional file types); this file installs
+# the core packages:
 #
 #   py -m pip install -r requirements-rag.txt
-#
-# Chroma downloads its default local embedding model on first use.
-# That model is used locally to build/search vector indexes.
 
-chromadb>=0.5.0
-pypdf>=4.0.0
-python-docx>=1.1.0
-openpyxl>=3.1.0
-
-# API client: on some networks the gateway only works with this library
-# (Settings > API client); the app falls back to Python's built-in client without it.
-openai>=1.40.0
+-r requirements.txt

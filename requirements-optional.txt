@@ -1,0 +1,41 @@
+# Optional packages, one group per feature. The app works without any of them; a
+# missing group only means those files are listed as "needs X" when indexing.
+#
+# install.bat (through "py jobcontext.txt --install") installs each group on its own,
+# so one blocked package doesn't stop the others, then shows what worked. All are
+# pure Python or ship ready-built wheels: no admin rights or separate installers.
+#
+# Format read by the installer:  "# == <group> ==  check: <modules to import>"
+# followed by the group's packages.
+
+# == PowerPoint (.pptx) ==  check: pptx
+# Reads slide text, tables and speaker notes.
+python-pptx>=1.0.0
+
+# == Old Excel (.xls) ==  check: xlrd
+# Reads Excel 97-2003 workbooks (xlrd 2.x reads .xls only).
+xlrd>=2.0.0
+
+# == Outlook email (.msg) ==  check: olefile, compressed_rtf
+# Reads saved Outlook emails: sender, recipients, date, subject, body and attachments.
+# compressed-rtf is only needed for emails stored with an RTF body only.
+olefile>=0.46
+compressed-rtf>=1.0.6
+
+# == Encrypted PDFs ==  check: cryptography
+# pypdf needs this to open AES-encrypted PDFs (many "restricted" PDFs are). pypdfium2
+# from the OCR group also reads them, so either group is enough.
+cryptography>=3.1
+
+# == OCR (scanned PDF pages and images) ==  check: pypdfium2, PIL, winrt.windows.media.ocr, winrt.windows.graphics.imaging, winrt.windows.storage.streams, winrt.windows.foundation.collections
+# Uses Windows' own OCR engine: no models to download. pypdfium2 renders scanned PDF
+# pages as images; Pillow handles images; the winrt packages reach Windows OCR.
+pypdfium2>=4.0.0
+Pillow>=9.0.0
+winrt-runtime>=2.0.0
+winrt-Windows.Media.Ocr>=2.0.0
+winrt-Windows.Graphics.Imaging>=2.0.0
+winrt-Windows.Storage.Streams>=2.0.0
+winrt-Windows.Foundation>=2.0.0
+winrt-Windows.Foundation.Collections>=2.0.0
+winrt-Windows.Globalization>=2.0.0

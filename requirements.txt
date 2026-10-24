@@ -1,0 +1,20 @@
+# Core packages: the app needs all of these. install.bat installs them; by hand:
+#
+#   py -m pip install -r requirements.txt
+#
+# Optional file types (PowerPoint, old Excel, Outlook email, encrypted PDFs, OCR)
+# are in requirements-optional.txt; install.bat installs each group separately and
+# shows which ones worked.
+
+# Document search: the local vector database. Its built-in embedding model downloads
+# on first use unless an API embedding model is set in Settings.
+chromadb>=0.5.0
+
+# PDF text, Word (.docx) and Excel (.xlsx, .xlsm) readers.
+pypdf>=4.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+
+# API client: on some networks the gateway only works with this library
+# (Settings > API client); the app falls back to Python's built-in client without it.
+openai>=1.40.0
