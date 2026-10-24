@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.8.0"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -2324,9 +2324,10 @@ INDEX_JOBS: dict[str, dict] = {}
 INDEX_LOCK = threading.Lock()
 
 
-def run_index(kind: str, item_id: str, path: str, progress=None) -> dict:
-    """Index a folder now (raises on failure) and save the layer's repository info."""
-    result = rag.index_layer(kind, item_id, path, progress=progress)
+def run_index(kind: str, item_id: str, path: str, progress=None, rebuild: bool = False) -> dict:
+    """Index a folder now (raises on failure) and save the layer's repository info.
+    Unchanged files are skipped unless rebuild is set (see rag.index_layer)."""
+    result = rag.index_layer(kind, item_id, path, progress=progress, rebuild=rebuild)
 
     layer = load(kind, item_id)                     # fresh copy: keep edits made meanwhile
     repository = dict(_default_repository(kind, item_id))
@@ -2344,6 +2345,7 @@ def run_index(kind: str, item_id: str, path: str, progress=None) -> dict:
         "failed": result.get("failed", []),
         "warnings": result.get("warnings", []),
         "unsupported": result.get("unsupported", {}),
+        "timings": result.get("timings", {}),
     })
     layer["repository"] = repository
     layer["updated"] = time.time()
@@ -2351,7 +2353,7 @@ def run_index(kind: str, item_id: str, path: str, progress=None) -> dict:
     return {"repository": repository, "source_files_seen": result.get("source_files_seen", 0)}
 
 
-def _index_worker(kind: str, item_id: str, path: str) -> None:
+def _index_worker(kind: str, item_id: str, path: str, rebuild: bool = False) -> None:
     key = f"{kind}:{item_id}"
 
     def progress(update: dict) -> None:
@@ -2360,10 +2362,11 @@ def _index_worker(kind: str, item_id: str, path: str) -> None:
             if update.get("phase") == "embedded":
                 job["embedded"] = update.get("embedded", 0)
             else:
-                job.update({k: update[k] for k in ("done", "total", "file") if k in update})
+                job.update({k: update[k] for k in ("done", "total", "file", "skipped")
+                            if k in update})
 
     try:
-        result = run_index(kind, item_id, path, progress)
+        result = run_index(kind, item_id, path, progress, rebuild)
         with INDEX_LOCK:
             INDEX_JOBS[key].update(state="done", finished=time.time(),
                                    repository=result["repository"])
@@ -2384,7 +2387,9 @@ def index_repository(kind, item_id, body, query):
     Start indexing a layer's folder in the background; poll GET for progress.
 
     Request body:
-        {"path": "<folder to index>"}
+        {"path": "<folder to index>", "rebuild": false}
+
+    Unchanged files are skipped; "rebuild": true re-reads and re-embeds everything.
     """
     load(kind, item_id)                             # 404 if the layer doesn't exist
     path = str(body.get("path") or "").strip()
@@ -2397,11 +2402,12 @@ def index_repository(kind, item_id, body, query):
         if job and job.get("state") == "running":
             return {"job": dict(job)}
         INDEX_JOBS[key] = {
-            "state": "running", "done": 0, "total": 0, "file": "", "embedded": 0,
+            "state": "running", "done": 0, "total": 0, "file": "", "embedded": 0, "skipped": 0,
             "error": "", "started": time.time(),
             "embedding": rag.EMBED_ID, "uses_api": rag.EMBED_ID.startswith("api:"),
         }
-    threading.Thread(target=_index_worker, args=(kind, item_id, path), daemon=True).start()
+    threading.Thread(target=_index_worker, args=(kind, item_id, path, bool(body.get("rebuild"))),
+                     daemon=True).start()
     return {"job": dict(INDEX_JOBS[key])}
 
 
@@ -4538,11 +4544,24 @@ function indexProblemsText(repo) {
   return parts.length ? parts.join(", ") + " (see the index report below)." : "";
 }
 
+function timingsText(t) {
+  if (!t || t.total_seconds === undefined) return "";
+  const parts = [`${t.mode}: ${t.files_read} file(s) read, ${t.files_unchanged} unchanged`,
+    `reading ${t.read_seconds} s` + (t.ocr_pages ? ` (OCR ${t.ocr_pages} pages, ${t.ocr_seconds} s)` : ""),
+    `embedding ${t.passages_embedded} passages ${t.embed_seconds} s`,
+    `total ${t.total_seconds} s`];
+  const slow = (t.slowest_files || []).filter((f) => f.seconds >= 1)
+    .map((f) => `${f.file} ${f.seconds} s`).join(", ");
+  return `Last index: ${parts.join(" · ")}.` + (slow ? ` Slowest files: ${slow}.` : "");
+}
+
 function indexReportHtml(repo) {
+  const timing = timingsText(repo.timings);
   const failed = repo.failed || [];
   const warnings = repo.warnings || [];
   const unsupported = Object.entries(repo.unsupported || {});
-  if (!failed.length && !warnings.length && !unsupported.length) return "";
+  const timingHtml = timing ? `<div class="muted">${esc(timing)}</div>` : "";
+  if (!failed.length && !warnings.length && !unsupported.length) return timingHtml;
   const list = (items) => `<ul>${items.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`;
   const sections = [];
   if (failed.length) {
@@ -4557,7 +4576,7 @@ function indexReportHtml(repo) {
         <div class="source-location">${esc((group.files || []).join(", "))}${
           group.count > (group.files || []).length ? ", …" : ""}</div></li>`).join("")}</ul>`);
   }
-  return `<details class="index-report"><summary>Index report: what was not read</summary>
+  return `${timingHtml}<details class="index-report"><summary>Index report: what was not read</summary>
     ${sections.join("")}</details>`;
 }
 
@@ -4619,6 +4638,7 @@ async function watchIndexing(kind, layerId, quietIfIdle = false) {
     detail.textContent =
       `Indexing with the ${how}: `
       + (job.total ? `${job.done} of ${job.total} files read` : "finding files")
+      + (job.skipped ? ` · ${job.skipped} unchanged (skipped)` : "")
       + (job.file ? ` (now: ${job.file})` : "")
       + (job.embedded ? ` · ${job.embedded} passages embedded` : "")
       + "…";
@@ -4673,7 +4693,7 @@ async function loadBrief(layerId) {
   if (running) {
     lines.push(job.phase === "Writing the brief"
       ? "Writing the brief from the file cards…"
-      : `Reading files: ${job.done || 0} of ${job.total || "?"}`
+      : `Writing file cards (API; separate from indexing, unchanged files reuse their cards): ${job.done || 0} of ${job.total || "?"}`
         + (job.file ? ` (now: ${job.file})` : "") + "…");
   } else if (job.state === "error") {
     lines.push(`Brief generation failed: ${job.error}`);
@@ -4780,6 +4800,10 @@ function renderLibEdit() {
       <div class="repo-actions">
         <button id="repo-index" class="primary">
           ${repo.enabled ? "Re-index folder" : "Index folder"}
+        </button>
+        <button id="repo-rebuild" ${repo.enabled ? "" : "disabled"}
+          title="Re-read and re-embed every file, not only new and changed ones">
+          Rebuild from scratch
         </button>
         <button id="repo-refresh">Refresh status</button>
         <button id="repo-clear" class="danger" ${repo.enabled ? "" : "disabled"}>
@@ -4901,7 +4925,7 @@ function renderLibEdit() {
     }
   };
 
-  $("#repo-index").onclick = async () => {
+  const startIndexing = async (rebuild) => {
     const folder = $("#repo-path").value.trim();
 
     if (!folder) {
@@ -4911,7 +4935,8 @@ function renderLibEdit() {
 
     $("#repo-index").disabled = true;
     try {
-      await api(`/api/${kind}/${layer.id}/repository/index`, { json: { path: folder } });
+      await api(`/api/${kind}/${layer.id}/repository/index`,
+        { json: { path: folder, rebuild } });
       watchIndexing(kind, layer.id);
     } catch (error) {
       $("#repo-index").disabled = false;
@@ -4919,6 +4944,8 @@ function renderLibEdit() {
       toast(error.message);
     }
   };
+  $("#repo-index").onclick = () => startIndexing(false);
+  $("#repo-rebuild").onclick = () => startIndexing(true);
 
   // Pick up an indexing run that is already in progress (e.g. after reopening).
   watchIndexing(kind, layer.id, true);

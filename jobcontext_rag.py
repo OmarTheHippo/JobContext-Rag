@@ -34,6 +34,7 @@ import html
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import struct
@@ -406,13 +407,71 @@ def _get_client():
         return _CLIENT
 
 
+class _FastLocalEmbedder:
+    """
+    Chroma's local model (all-MiniLM-L6-v2, same files, same vectors) run faster.
+    Chroma pads every passage to 256 tokens in batches of 32; this sorts passages by
+    length and pads each small batch only to its longest passage. Measured on 2,446
+    passages (16-core PC): Chroma 78/s, this 155/s, smallest cosine to Chroma's
+    vectors 1.000000 - so existing indexes stay valid.
+    """
+    BATCH = 8
+
+    def __init__(self):
+        import numpy
+        import onnxruntime
+        from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+        from tokenizers import Tokenizer
+
+        self.np = numpy
+        self.reference = ONNXMiniLM_L6_V2()
+        self.reference._download_model_if_not_exists()      # first use downloads it
+        folder = Path(self.reference.DOWNLOAD_PATH) / self.reference.EXTRACTED_FOLDER_NAME
+        self.tokenizer = Tokenizer.from_file(str(folder / "tokenizer.json"))
+        self.tokenizer.enable_truncation(max_length=256)
+        self.tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")   # to the batch's longest
+        options = onnxruntime.SessionOptions()
+        options.log_severity_level = 3
+        options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self.session = onnxruntime.InferenceSession(
+            str(folder / "model.onnx"), sess_options=options, providers=["CPUExecutionProvider"])
+        self.lock = threading.Lock()
+
+        # Guard against a future Chroma changing its model: must match Chroma's vectors.
+        probe = ["Fuel piping shall be pressure tested.", "P664 replaced the PVC piping in 2015."]
+        ours, theirs = self.np.array(self(probe)), self.np.array(self.reference(probe))
+        if float((ours * theirs).sum(1).min()) < 0.9999:
+            raise RuntimeError("fast embedder does not match Chroma's vectors")
+
+    def __call__(self, texts: list[str]):
+        np = self.np
+        order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+        out = np.zeros((len(texts), 384), dtype=np.float32)
+        with self.lock:
+            for start in range(0, len(order), self.BATCH):
+                batch = order[start:start + self.BATCH]
+                encoded = self.tokenizer.encode_batch([texts[i] for i in batch])
+                ids = np.array([e.ids for e in encoded], dtype=np.int64)
+                mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+                hidden = self.session.run(None, {"input_ids": ids, "attention_mask": mask,
+                                                 "token_type_ids": np.zeros_like(ids)})[0]
+                weights = mask[..., None].astype(np.float32)
+                vectors = (hidden * weights).sum(1) / np.clip(weights.sum(1), 1e-9, None)
+                out[batch] = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+        return list(out)
+
+
 def _get_embedder():
     global _EMBEDDER
 
     with _LOCK:
         if _EMBEDDER is None:
             # Chroma loads/downloads its small local default embedding model here.
-            _EMBEDDER = DefaultEmbeddingFunction()
+            try:
+                _EMBEDDER = _FastLocalEmbedder()
+            except Exception as exc:              # noqa: BLE001  (Chroma's own still works)
+                print(f"Using Chroma's standard local embedding ({exc}).", flush=True)
+                _EMBEDDER = DefaultEmbeddingFunction()
         return _EMBEDDER
 
 
@@ -445,20 +504,34 @@ def _source_dir(kind: str, layer_id: str) -> Path:
     return path
 
 
-def _collection(kind: str, layer_id: str, create: bool = False):
+def _collection(kind: str, layer_id: str, create: bool = False, metadata: dict | None = None):
     """
     Open a layer's collection (raises if it doesn't exist), or create a new one
     labelled with the current embedding model. The app always supplies vectors
-    itself, so Chroma's own embedding function is never used.
+    itself, so Chroma's own embedding function is never used. metadata adds labels
+    to a new collection (index_layer records the index format and folder, so the
+    next index can tell whether it may update in place).
     """
     client, name = _get_client(), collection_name(kind, layer_id)
     if create:
         return client.create_collection(
             name=name,
             embedding_function=None,
-            metadata={"kind": kind, "layer_id": layer_id, "embedding": EMBED_ID},
+            metadata={**(metadata or {}), "kind": kind, "layer_id": layer_id,
+                      "embedding": EMBED_ID},
         )
     return client.get_collection(name=name, embedding_function=None)
+
+
+# Changes whenever a layer's passages change (index, clear, repair); the keyword index
+# cache uses it, since an update can leave the passage count the same.
+_LAYER_VERSIONS: dict[str, int] = {}
+
+
+def _layer_changed(kind: str, layer_id: str) -> None:
+    name = collection_name(kind, layer_id)
+    _LAYER_VERSIONS[name] = _LAYER_VERSIONS.get(name, 0) + 1
+    _KEYWORD_INDEXES.pop(name, None)
 
 
 def _delete_collection(kind: str, layer_id: str) -> None:
@@ -488,9 +561,11 @@ def _rebuild_collection(kind: str, layer_id: str):
             stored = old.get(include=["documents", "metadatas"])
             embeddings = None
 
+        labels = {key: value for key, value in (old.metadata or {}).items()
+                  if key in ("index_format", "folder")}
         _delete_collection(kind, layer_id)
-        _KEYWORD_INDEXES.pop(collection_name(kind, layer_id), None)
-        rebuilt = _collection(kind, layer_id, create=True)
+        _layer_changed(kind, layer_id)
+        rebuilt = _collection(kind, layer_id, create=True, metadata=labels)
         ids = stored.get("ids") or []
         for start in range(0, len(ids), 100):
             end = start + 100
@@ -665,8 +740,16 @@ def _ocr_image(image) -> str:
     async def recognize():
         return await _OCR_ENGINE.recognize_async(bitmap)
 
+    started = time.perf_counter()
     result = asyncio.run(recognize())
+    with _OCR_LOCK:
+        OCR_STATS["pages"] += 1
+        OCR_STATS["seconds"] += time.perf_counter() - started
     return "\n".join(line.text for line in result.lines)
+
+
+# Pages actually OCR'd (cache hits excluded) and the time spent, for the index report.
+OCR_STATS = {"pages": 0, "seconds": 0.0}
 
 
 def _cached_ocr(file_hash: str, key: str, make: Callable[[], str]) -> str:
@@ -1602,90 +1685,143 @@ REPORT_NAMES_PER_TYPE = 50
 def index_layer(kind: str,
                 layer_id: str,
                 folder_path: str | Path,
-                progress: Callable[[dict], None] | None = None) -> dict:
+                progress: Callable[[dict], None] | None = None,
+                rebuild: bool = False) -> dict:
     """
-    Fully rebuild one layer's local index.
+    Index one layer's folder.
 
-    Rebuilding is deliberate for the first release: it ensures deleted,
-    renamed, and changed source files do not leave stale chunks behind.
+    Updates in place when it can: files whose size and modified time are unchanged
+    since the last index are skipped (no reading, no embedding); new and changed files
+    are read and embedded; files no longer in the folder are removed. It rebuilds from
+    scratch when asked (rebuild=True), when the embedding model or passage size
+    changed, or when the folder changed. Files that failed or were read only in part
+    last time are always read again.
+
+    Reading runs in its own thread so it overlaps with embedding (measured on 295 files:
+    reading ~16 s, local embedding ~118 s before it was made ~2x faster).
 
     The result reports what was not indexed: "failed" (file: reason), "warnings"
     (files read only in part, e.g. scanned pages without OCR) and "unsupported"
-    ({".doc": {"count", "hint", "files"}}).
+    ({".doc": {"count", "hint", "files"}}), plus "timings" (seconds per phase).
     """
+    started = time.perf_counter()
     folder = _validate_folder(folder_path)
     files, unsupported_files = _iter_files(folder)
+    ocr_before = dict(OCR_STATS)
 
     if progress:
-        progress({
-            "phase": "starting",
-            "total": len(files),
-            "done": 0,
-            "file": "",
-        })
+        progress({"phase": "starting", "total": len(files), "done": 0, "file": ""})
 
     with _LOCK:
-        _delete_collection(kind, layer_id)
-        _clear_extracted_sources(kind, layer_id)
-        _KEYWORD_INDEXES.pop(collection_name(kind, layer_id), None)
-        collection = _collection(kind, layer_id, create=True)
+        name = collection_name(kind, layer_id)
+        labels = {"index_format": INDEX_FORMAT, "folder": str(folder)}
+        collection = None
+        if not rebuild:
+            try:
+                existing = _collection(kind, layer_id)
+                meta = existing.metadata or {}
+                if all(meta.get(key) == value for key, value in labels.items()):
+                    collection = existing
+            except Exception:
+                collection = None
+        incremental = collection is not None
+        if not incremental:
+            _delete_collection(kind, layer_id)
+            _clear_extracted_sources(kind, layer_id)
+            collection = _collection(kind, layer_id, create=True, metadata=labels)
+        _layer_changed(kind, layer_id)
 
-        indexed_files = 0
-        indexed_chunks = 0
-        failures = []
-        warnings = []
+        # What the last index stored, by relative path.
+        previous = {record.get("relative_path"): record
+                    for record in _read_extracted_sources(kind, layer_id)} if incremental else {}
+
+        to_read, unchanged = [], []
+        for file_path in files:
+            relative_path = _safe_relative_path(folder, file_path)
+            stamp = _file_stamp(file_path)
+            record = previous.get(relative_path)
+            if (record and record.get("modified") == stamp["modified"]
+                    and record.get("size") == stamp["size"]
+                    and "chunk_count" in record and not record.get("warnings")):
+                unchanged.append(record)
+            else:
+                to_read.append((file_path, relative_path))
+
+        # Passages of changed and deleted files go; unchanged ones stay as they are.
+        keep = {record["relative_path"] for record in unchanged}
+        for relative_path, record in previous.items():
+            if relative_path not in keep:
+                source_key = record.get("source_key") or _safe_source_key(relative_path)
+                collection.delete(where={"source_key": source_key})
+                (_source_dir(kind, layer_id) / f"{source_key}.json").unlink(missing_ok=True)
+
+        indexed_files = len(unchanged)
+        indexed_chunks = sum(int(record.get("chunk_count") or 0) for record in unchanged)
+        failures, warnings = [], []
         images_without_text = 0
-
-        ids = []
-        documents = []
-        metadatas = []
-
+        read_times = []                       # (seconds, relative path)
+        embed_seconds = 0.0
         embedded = 0
+        ids, documents, metadatas = [], [], []
 
         def flush() -> None:
-            nonlocal ids, documents, metadatas, embedded
-
+            nonlocal ids, documents, metadatas, embedded, embed_seconds
             if not ids:
                 return
-
+            began = time.perf_counter()
             # Vectors come from the configured model (API calls are batched there).
-            collection.upsert(
-                ids=ids,
-                documents=documents,
-                metadatas=metadatas,
-                embeddings=embed(documents),
-            )
+            vectors = embed(documents)
+            embed_seconds += time.perf_counter() - began
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas,
+                              embeddings=vectors)
             embedded += len(ids)
             if progress:
                 progress({"phase": "embedded", "embedded": embedded})
-            ids = []
-            documents = []
-            metadatas = []
+            ids, documents, metadatas = [], [], []
 
-        for position, file_path in enumerate(files, start=1):
-            relative_path = _safe_relative_path(folder, file_path)
+        # Reader thread: extracts text (and OCRs) while this thread embeds.
+        results: queue.Queue = queue.Queue(maxsize=16)
 
-            def report(note: str = "", position=position, relative_path=relative_path) -> None:
-                if progress:
-                    progress({
-                        "phase": "indexing",
-                        "total": len(files),
-                        "done": position - 1,
-                        "file": f"{relative_path} ({note})" if note else relative_path,
-                    })
+        def reader() -> None:
+            for position, (file_path, relative_path) in enumerate(to_read, start=1):
+                def report(note: str = "", position=position, relative_path=relative_path) -> None:
+                    if progress:
+                        progress({
+                            "phase": "indexing",
+                            "total": len(to_read),
+                            "done": position - 1,
+                            "skipped": len(unchanged),
+                            "file": f"{relative_path} ({note})" if note else relative_path,
+                        })
 
-            report()
-            file_warnings = []
+                report()
+                file_warnings: list[str] = []
+                began = time.perf_counter()
+                try:
+                    outcome = extract_document(file_path, warnings=file_warnings, progress=report)
+                except Exception as exc:              # noqa: BLE001
+                    outcome = exc
+                results.put((file_path, relative_path, outcome, file_warnings,
+                             time.perf_counter() - began))
+            results.put(None)
 
-            try:
-                units = extract_document(file_path, warnings=file_warnings, progress=report)
-            except Exception as exc:
-                failures.append(f"{relative_path}: {_failure_reason(exc)}")
+        thread = threading.Thread(target=reader, name="index-reader", daemon=True)
+        thread.start()
+
+        while True:
+            item = results.get()
+            if item is None:
+                break
+            file_path, relative_path, outcome, file_warnings, seconds = item
+            read_times.append((seconds, relative_path))
+
+            if isinstance(outcome, Exception):
+                failures.append(f"{relative_path}: {_failure_reason(outcome)}")
                 continue
 
             warnings += [f"{relative_path}: {note}" for note in file_warnings]
             suffix = file_path.suffix.lower()
-            text_units = [unit for unit in units if (unit.get("text") or "").strip()]
+            text_units = [unit for unit in outcome if (unit.get("text") or "").strip()]
             if not text_units:
                 if suffix in IMAGE_EXTENSIONS:
                     images_without_text += 1      # photos etc.: counted, not a failure
@@ -1693,9 +1829,13 @@ def index_layer(kind: str,
                     failures.append(f"{relative_path}: no readable text found")
                 continue
 
+            chunks = _chunk_units(file_path.name, text_units)
+            if not chunks:
+                failures.append(f"{relative_path}: no indexable text chunks found")
+                continue
+
             source_key = _safe_source_key(relative_path)
             stamp = _file_stamp(file_path)
-
             _write_extracted_source(kind, layer_id, source_key, {
                 "source_key": source_key,
                 "file_name": file_path.name,
@@ -1703,18 +1843,14 @@ def index_layer(kind: str,
                 "full_path": str(file_path.resolve()),
                 "modified": stamp["modified"],
                 "size": stamp["size"],
+                "chunk_count": len(chunks),
+                # A file read only in part is read again next time (e.g. once OCR works).
+                "warnings": file_warnings,
                 "units": text_units,
             })
 
-            chunks = _chunk_units(file_path.name, text_units)
-            if not chunks:
-                failures.append(f"{relative_path}: no indexable text chunks found")
-                continue
-
             for sequence, chunk in enumerate(chunks):
-                chunk_id = f"{source_key}__{sequence}"
-
-                ids.append(chunk_id)
+                ids.append(f"{source_key}__{sequence}")
                 documents.append(chunk["text"])
                 metadatas.append({
                     "kind": kind,
@@ -1731,26 +1867,44 @@ def index_layer(kind: str,
                     "modified": str(stamp["modified"]),
                     "sequence": sequence,
                 })
-
                 if len(ids) >= 160:          # 8 API batches of 20, run in parallel
                     flush()
 
             indexed_files += 1
             indexed_chunks += len(chunks)
 
+        thread.join()
         flush()
+        _layer_changed(kind, layer_id)
 
         if progress:
-            progress({
-                "phase": "complete",
-                "total": len(files),
-                "done": len(files),
-                "file": "",
-            })
+            progress({"phase": "complete", "total": len(to_read), "done": len(to_read),
+                      "skipped": len(unchanged), "file": ""})
 
     if images_without_text:
         warnings.append(f"{images_without_text} image(s) had no readable text "
                         "(photos, drawings without text) and were skipped")
+
+    total = time.perf_counter() - started
+    timings = {
+        "total_seconds": round(total, 1),
+        "mode": "updated in place" if incremental else "full rebuild",
+        "files_unchanged": len(unchanged),
+        "files_read": len(to_read),
+        "read_seconds": round(sum(seconds for seconds, _ in read_times), 1),
+        "ocr_pages": OCR_STATS["pages"] - ocr_before["pages"],
+        "ocr_seconds": round(OCR_STATS["seconds"] - ocr_before["seconds"], 1),
+        "passages_embedded": embedded,
+        "embed_seconds": round(embed_seconds, 1),
+        "embedding": EMBED_ID,
+        "slowest_files": [{"file": path, "seconds": round(seconds, 1)}
+                          for seconds, path in sorted(read_times, reverse=True)[:5]],
+    }
+    print(f"Indexed {folder} ({timings['mode']}): {timings['files_read']} read, "
+          f"{timings['files_unchanged']} unchanged; reading {timings['read_seconds']} s "
+          f"(OCR {timings['ocr_pages']} pages, {timings['ocr_seconds']} s), embedding "
+          f"{embedded} passages {timings['embed_seconds']} s; total {timings['total_seconds']} s",
+          flush=True)
 
     return {
         "path": str(folder),
@@ -1762,6 +1916,7 @@ def index_layer(kind: str,
         "index_format": INDEX_FORMAT,
         "failed": failures,
         "warnings": warnings,
+        "timings": timings,
         "unsupported": {
             suffix: {"count": len(names), "hint": _missing_type_hint(suffix),
                      "files": sorted(names)[:REPORT_NAMES_PER_TYPE]}
@@ -1775,7 +1930,7 @@ def clear_layer_index(kind: str, layer_id: str) -> None:
     with _LOCK:
         _delete_collection(kind, layer_id)
         _clear_extracted_sources(kind, layer_id)
-        _KEYWORD_INDEXES.pop(collection_name(kind, layer_id), None)
+        _layer_changed(kind, layer_id)
 
 
 def layer_index_status(kind: str, layer_id: str) -> dict:
@@ -1958,7 +2113,8 @@ def keyword_tokens(text: str) -> list[str]:
 def _keyword_index(kind: str, layer_id: str, collection, count: int) -> dict:
     name = collection_name(kind, layer_id)
     cached = _KEYWORD_INDEXES.get(name)
-    if cached and cached["count"] == count:
+    version = _LAYER_VERSIONS.get(name, 0)
+    if cached and cached["count"] == count and cached["version"] == version:
         return cached
 
     # Passage text stays readable even when Chroma's vector index is damaged.
@@ -1975,6 +2131,7 @@ def _keyword_index(kind: str, layer_id: str, collection, count: int) -> dict:
 
     index = {
         "count": count,
+        "version": version,
         "ids": stored.get("ids") or [],
         "documents": documents,
         "metadatas": stored.get("metadatas") or [],

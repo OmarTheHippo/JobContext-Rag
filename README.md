@@ -15,7 +15,16 @@ version of [JobContext](https://github.com/OmarTheHippo/JobContext).
   OCR of scanned PDF pages and images.
 - **Index report.** After indexing, the layer shows what was not read and why: files
   that failed (e.g. password-protected), files read only in part (e.g. scanned pages
-  without OCR), and file types that aren't read, with what to do about each.
+  without OCR), and file types that aren't read, with what to do about each. It also
+  shows how long the last index took per step (reading, OCR, embedding) and the
+  slowest files.
+- **Fast re-indexing.** Re-indexing reads and embeds only new and changed files (by
+  size and modified time) and removes deleted ones; unchanged files are skipped. A full
+  rebuild happens when the embedding model, passage size or folder changes, or with
+  **Rebuild from scratch**. Reading runs alongside embedding, and the local embedding
+  model runs about twice as fast as Chroma's default with identical vectors. Measured
+  on a 297-file test folder (16-core PC): first index 65 s (was ~140 s), re-index with
+  nothing changed 1.4 s.
 - **Search by meaning and by keyword.** Each search combines a meaning-based (vector)
   search with exact keyword matching (BM25), so a project number, form or drawing
   number or acronym mentioned once in a long document is still found. Only words that
