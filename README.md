@@ -1,8 +1,7 @@
 # JobContext-Rag
 
 A local chat client for a GenAI API that carries **standing context** into every call
-and **searches your own documents** to ground its answers. It is the document-search
-version of [JobContext](https://github.com/OmarTheHippo/JobContext).
+and **searches your own documents** to ground its answers.
 
 - **Layers.** Each chat uses a **Role** layer (who you are), any number of **Project**
   layers, and any number of **Agent** layers (specialist roles such as legal or design
