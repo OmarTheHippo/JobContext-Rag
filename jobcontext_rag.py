@@ -41,6 +41,7 @@ import struct
 import tempfile
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -2071,6 +2072,17 @@ def index_layer(kind: str,
         results: queue.Queue = queue.Queue(maxsize=16)
 
         def reader() -> None:
+            # Always ends with None, and reports a crash, so the loop below can never
+            # wait forever for a reader that has stopped.
+            try:
+                read_all()
+            except BaseException as exc:              # noqa: BLE001
+                traceback.print_exc()
+                results.put(("reader stopped", exc))
+            finally:
+                results.put(None)
+
+        def read_all() -> None:
             for position, (file_path, relative_path) in enumerate(to_read, start=1):
                 def report(note: str = "", position=position, relative_path=relative_path) -> None:
                     if progress:
@@ -2093,7 +2105,6 @@ def index_layer(kind: str,
                     outcome = exc
                 results.put((file_path, relative_path, outcome, file_warnings,
                              time.perf_counter() - began, dates))
-            results.put(None)
 
         thread = threading.Thread(target=reader, name="index-reader", daemon=True)
         thread.start()
@@ -2102,6 +2113,11 @@ def index_layer(kind: str,
             item = results.get()
             if item is None:
                 break
+            if item[0] == "reader stopped":
+                thread.join()
+                raise RuntimeError(f"Reading the files stopped unexpectedly: "
+                                   f"{type(item[1]).__name__}: {item[1]}. Index again to "
+                                   "continue; files already read are kept.")
             file_path, relative_path, outcome, file_warnings, seconds, dates = item
             read_times.append((seconds, relative_path))
 
