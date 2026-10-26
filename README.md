@@ -46,6 +46,16 @@ and **searches your own documents** to ground its answers.
   common words don't; each layer gets a few reserved places for keyword matches so
   neither kind of search crowds out the other. The source list under each answer tags
   passages found by keyword. No re-index needed; switch it off in Settings.
+- **Passages that know where they come from.** Each passage is searched together with
+  a short header (file name, sheet, document title), so a passage like "Total |
+  6,800,000" or "install 650 feet of pipe" is found by a question naming the IGCE or the
+  SOW even when its text never says so. The header is used for searching only; the
+  model gets the passage with its source label. Spreadsheet and CSV passages repeat the
+  sheet's column header row, so a row deep in an estimate still arrives with "Line item
+  | Unit | Qty | Amount" above it.
+- **Neighbouring text.** The best few matches also get the passage before and after
+  them from the same file when it fits the budget, so a fact split at a passage
+  boundary arrives whole (on by default; Settings > Document search).
 - **Retrieval planner.** After a first search, an optional planning call reads the
   question, the recent conversation and the layer prompts, then runs targeted searches
   in any selected layer: project facts needed to apply a rule, or the requirements
@@ -59,6 +69,9 @@ and **searches your own documents** to ground its answers.
   card per file, then combines them into a brief (overview, cost, scope, document
   checklist, conflicts, gaps, inventory). The brief guides the planner and is sent with
   chats about that project. What it looks for is set in Settings > Brief guidance.
+  Each project has a **"Make file cards and a project brief"** switch (on by default).
+  Off: indexing makes no cards or brief (no API calls for them) and no brief is sent
+  with chats or to the planner; cards already made are kept for when it's switched on.
 
 ## Install
 
@@ -109,8 +122,8 @@ first time a folder is indexed. With an API embedding model nothing is downloade
   model, prose passages default to 3,000 characters; spreadsheet and CSV passages stay
   around 1,000 so single rows aren't buried. Texts are sent 20 per request. Changing
   the model or passage size requires re-indexing; the editor flags affected folders.
-  **Keyword matching** (on by default) and **OCR** (on by default, used when indexing)
-  can be switched off here.
+  **Keyword matching**, **OCR** (used when indexing) and **neighbouring text** (all on
+  by default) can be switched off here.
 - **Reply limit.** Models differ in how they accept a reply limit (`max_tokens`,
   `max_completion_tokens`, a lower maximum, or none at all). On Automatic, the app
   finds what the model accepts on the first request and reuses it; Settings can fix it.

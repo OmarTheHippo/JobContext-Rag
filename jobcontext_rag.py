@@ -196,7 +196,9 @@ LOCAL_MAX_CHUNK_CHARS = 800
 EMBED_ID = LOCAL_EMBED_ID
 CHUNK_CHARS = 800
 CHUNK_OVERLAP_CHARS = 150
-INDEX_FORMAT = f"{EMBED_ID}|chunks-{CHUNK_CHARS}-{CHUNK_OVERLAP_CHARS}"
+# "ctx1": passages are searched with a document header (see search_text); sheets repeat
+# their header row. Indexes built before that are rebuilt on their next index.
+INDEX_FORMAT = f"{EMBED_ID}|chunks-{CHUNK_CHARS}-{CHUNK_OVERLAP_CHARS}|ctx1"
 _EMBED_FN: Callable[[list[str]], list[list[float]]] | None = None   # None = local model
 _QUERY_VECTORS: dict[str, list[float]] = {}                          # search phrase cache
 
@@ -301,7 +303,8 @@ def configure_search(embed_fn: Callable[[list[str]], list[list[float]]] | None,
                      chunk_chars: int,
                      overlap_chars: int | None = None,
                      keyword_search: bool = True,
-                     ocr: bool = True) -> None:
+                     ocr: bool = True,
+                     neighbours: bool = True) -> None:
     """
     Choose the embedding model, passage size, keyword search and OCR (from Settings).
     embed_fn=None uses the local model. Indexes built with a different embed_id or
@@ -310,18 +313,19 @@ def configure_search(embed_fn: Callable[[list[str]], list[list[float]]] | None,
     the next index.
     """
     global _EMBED_FN, EMBED_ID, CHUNK_CHARS, CHUNK_OVERLAP_CHARS, INDEX_FORMAT
-    global KEYWORD_SEARCH, OCR_ENABLED
+    global KEYWORD_SEARCH, OCR_ENABLED, NEIGHBOURS
 
     if embed_fn is None:
         chunk_chars = min(chunk_chars, LOCAL_MAX_CHUNK_CHARS)
     with _LOCK:
         KEYWORD_SEARCH = bool(keyword_search)
+        NEIGHBOURS = bool(neighbours)
         OCR_ENABLED = bool(ocr)
         _EMBED_FN = embed_fn
         EMBED_ID = embed_id
         CHUNK_CHARS = max(300, int(chunk_chars))
         CHUNK_OVERLAP_CHARS = overlap_chars or max(100, CHUNK_CHARS // 6)
-        INDEX_FORMAT = f"{EMBED_ID}|chunks-{CHUNK_CHARS}-{CHUNK_OVERLAP_CHARS}"
+        INDEX_FORMAT = f"{EMBED_ID}|chunks-{CHUNK_CHARS}-{CHUNK_OVERLAP_CHARS}|ctx1"
         _QUERY_VECTORS.clear()
 
 
@@ -576,7 +580,8 @@ def _rebuild_collection(kind: str, layer_id: str):
                 documents=documents,
                 metadatas=stored["metadatas"][start:end],
                 embeddings=(embeddings[start:end] if embeddings is not None
-                            else embed(documents)),
+                            else embed([search_text(text, meta or {}) for text, meta in
+                                        zip(documents, stored["metadatas"][start:end])])),
             )
         return rebuilt
 
@@ -630,51 +635,10 @@ def _read_text_file(path: Path) -> list[dict]:
 
 
 def _read_csv(path: Path) -> list[dict]:
-    rows = []
-
     with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-        reader = csv.reader(handle)
-        for row_num, row in enumerate(reader, start=1):
-            cells = [str(cell).strip() for cell in row]
-            if any(cells):
-                rows.append((row_num, " | ".join(cells)))
-
-    if not rows:
-        return []
-
-    blocks = []
-    current = []
-    start_row = rows[0][0]
-    last_row = start_row
-
-    for row_num, text in rows:
-        projected = "\n".join(current + [text])
-        if current and len(projected) > _table_chunk_chars():
-            blocks.append({
-                "text": "\n".join(current),
-                "location": _display_location(sheet="CSV", row_start=start_row, row_end=last_row),
-                "page": None,
-                "sheet": "CSV",
-                "row_start": start_row,
-                "row_end": last_row,
-            })
-            current = []
-            start_row = row_num
-
-        current.append(text)
-        last_row = row_num
-
-    if current:
-        blocks.append({
-            "text": "\n".join(current),
-            "location": _display_location(sheet="CSV", row_start=start_row, row_end=last_row),
-            "page": None,
-            "sheet": "CSV",
-            "row_start": start_row,
-            "row_end": last_row,
-        })
-
-    return blocks
+        rows = [(number, [str(cell).strip() for cell in row])
+                for number, row in enumerate(csv.reader(handle), start=1)]
+    return _sheet_blocks("CSV", rows)
 
 
 def _unit(text: str, location: str, page: int | None = None, sheet: str | None = None,
@@ -954,13 +918,30 @@ def _read_pptx(path: Path) -> list[dict]:
     return units
 
 
+# Rows near the top of a sheet that are checked for a header row.
+HEADER_SEARCH_ROWS = 10
+
+
+def _is_header_row(values: list[str]) -> bool:
+    """At least two filled cells, all labels: no numbers, money or dates."""
+    filled = [value for value in values if value]
+    if len(filled) < 2:
+        return False
+    return not any(re.fullmatch(r"[\s$€£%()+\-.,\d]+", value) or _parse_date(value)
+                   for value in filled)
+
+
 def _sheet_blocks(title: str, rows) -> list[dict]:
     """
     One sheet's rows as passages of whole rows. rows yields (row_number, [cell text]).
     Each row is a separate fact (one cost line, one item), so passages stay small.
+    The sheet's header row (the first row of column labels near the top) is repeated
+    at the start of every later passage, so "Replace pipe | 412000" still arrives
+    with "Line item | Amount" above it.
     """
     blocks, current = [], []
     start_row = last_row = None
+    header, header_row, rows_in_block = "", None, 0
 
     def flush() -> None:
         blocks.append(_unit("\n".join(current),
@@ -971,16 +952,20 @@ def _sheet_blocks(title: str, rows) -> list[dict]:
         if not any(values):
             continue
         line = " | ".join(values)
+        if not header and row_number <= HEADER_SEARCH_ROWS and _is_header_row(values):
+            header, header_row = line, row_number
         if start_row is None:
             start_row = row_number
-        if current and len("\n".join(current + [line])) > _table_chunk_chars():
+        if rows_in_block and len("\n".join(current + [line])) > _table_chunk_chars():
             flush()
-            current = []
+            current = [f"[columns] {header}"] if header and header_row != row_number else []
+            rows_in_block = 0
             start_row = row_number
         current.append(line)
+        rows_in_block += 1
         last_row = row_number
 
-    if current:
+    if rows_in_block:
         flush()
     return blocks
 
@@ -1946,6 +1931,33 @@ def _validate_folder(path: str | Path) -> Path:
 REPORT_NAMES_PER_TYPE = 50
 
 
+def _document_title(units: list[dict]) -> str:
+    """The first line of a document's first page or sheet, as its title."""
+    for line in _first_page_text(units).splitlines():
+        line = line.strip(" |\t")
+        if len(line) >= 3:
+            return line[:120]
+    return ""
+
+
+def search_text(text: str, meta: dict) -> str:
+    """
+    What is searched for a passage: a short document header, then the passage. A
+    passage like "Total | 6,800,000" or "Scope: replace 650 ft" rarely names its
+    document; with the file name, sheet and title in front, a question naming the
+    document (an IGCE, a SOW, a policy) can find it. Only the search sees the header -
+    the model gets the passage with its source label, which already says the same.
+    """
+    parts = [meta.get("file_name", "")]
+    if meta.get("sheet") and meta.get("sheet") != "CSV":
+        parts.append(f"sheet {meta['sheet']}")
+    title = meta.get("doc_title", "")
+    if title and title not in (text or "")[:200]:
+        parts.append(title)
+    header = " | ".join(part for part in parts if part)
+    return f"{header}\n{text}" if header else text
+
+
 def _file_date(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
 
@@ -2059,7 +2071,7 @@ def index_layer(kind: str,
                 return
             began = time.perf_counter()
             # Vectors come from the configured model (API calls are batched there).
-            vectors = embed(documents)
+            vectors = embed([search_text(text, meta) for text, meta in zip(documents, metadatas)])
             embed_seconds += time.perf_counter() - began
             collection.upsert(ids=ids, documents=documents, metadatas=metadatas,
                               embeddings=vectors)
@@ -2156,6 +2168,7 @@ def index_layer(kind: str,
                 "units": text_units,
             })
             date_metadata = _chunk_date_metadata(dates)
+            date_metadata["doc_title"] = _document_title(text_units)
 
             for sequence, chunk in enumerate(chunks):
                 ids.append(f"{source_key}__{sequence}")
@@ -2439,8 +2452,10 @@ def _keyword_index(kind: str, layer_id: str, collection, count: int) -> dict:
     documents = stored.get("documents") or []
     postings: dict[str, dict[int, int]] = {}
     lengths = []
+    metadatas = stored.get("metadatas") or []
     for number, text in enumerate(documents):
-        tokens = keyword_tokens(text or "")
+        meta = metadatas[number] if number < len(metadatas) else {}
+        tokens = keyword_tokens(search_text(text or "", meta or {}))
         lengths.append(len(tokens))
         for token in tokens:
             bucket = postings.setdefault(token, {})
@@ -2735,6 +2750,79 @@ def _selected_layers(chat: dict, load_layer: Callable[[str, str], dict]) -> list
     return selected
 
 
+# Neighbouring text: the best few passages of an answer also get the passage before
+# and after them in the same file, when it fits the budget. A fact split at a passage
+# boundary (the label at the end of one passage, the number at the start of the next)
+# then arrives whole. On/off from Settings via configure_search().
+NEIGHBOURS = True
+NEIGHBOUR_PASSAGES = 4
+
+
+def _join_overlapping(first: str, second: str) -> str:
+    """Join consecutive passages, dropping the text they share (passages overlap)."""
+    for size in range(min(len(first), len(second), CHUNK_OVERLAP_CHARS + 80), 19, -1):
+        if first.endswith(second[:size]):
+            return first + second[size:]
+    return first + "\n" + second
+
+
+def _with_neighbours(kept: list[dict], token_budget: int, tokens_used: int) -> tuple[int, int]:
+    """
+    Extend the best NEIGHBOUR_PASSAGES prose passages of kept (in place) with the
+    passages next to them. A neighbour that was also selected on its own is merged
+    in rather than sent twice. Spreadsheet passages are left alone: each already
+    carries its sheet's header row. Returns (tokens used, passages extended).
+    """
+    if not NEIGHBOURS:
+        return tokens_used, 0
+    by_id = {record.get("id"): record for record in kept if record.get("id")}
+    merged_away: set = set()
+    extended = 0
+    for record in [r for r in kept if not r["metadata"].get("sheet")][:NEIGHBOUR_PASSAGES]:
+        meta = record["metadata"]
+        if record.get("id") in merged_away or meta.get("source_key") is None \
+                or meta.get("sequence") in (None, ""):
+            continue
+        key, sequence = meta["source_key"], int(meta["sequence"])
+        wanted = [f"{key}__{sequence - 1}", f"{key}__{sequence + 1}"]
+        try:
+            got = _collection(record["kind"], record["layer_id"]).get(
+                ids=wanted, include=["documents", "metadatas"])
+        except Exception:                         # noqa: BLE001
+            continue
+        found = {i: (d, m or {}) for i, d, m in zip(got.get("ids") or [], got.get("documents") or [],
+                                                    got.get("metadatas") or [])}
+        before, after = found.get(wanted[0]), found.get(wanted[1])
+        if not before and not after:
+            continue
+
+        text, locations = record["text"], [meta.get("location", "")]
+        if before:
+            text = _join_overlapping(before[0], text)
+            locations.insert(0, before[1].get("location", ""))
+        if after:
+            text = _join_overlapping(text, after[0])
+            locations.append(after[1].get("location", ""))
+        merged_meta = dict(meta, location=" to ".join(dict.fromkeys(l for l in locations if l)))
+        block = _format_block(dict(record, text=text, metadata=merged_meta))
+        tokens = _estimate_tokens(block)
+        absorbed = [by_id[i] for i in wanted if i in by_id and i not in merged_away
+                    and by_id[i] is not record]
+        change = tokens - record["tokens"] - sum(other["tokens"] for other in absorbed)
+        if tokens_used + change > token_budget:
+            continue
+        tokens_used += change
+        for other in absorbed:
+            merged_away.add(other.get("id"))
+            for need in other.get("needs", []):
+                if need not in record.setdefault("needs", []):
+                    record["needs"].append(need)
+        record.update(text=text, metadata=merged_meta, block=block, tokens=tokens, neighbours=True)
+        extended += 1
+    kept[:] = [record for record in kept if record.get("id") not in merged_away]
+    return tokens_used, extended
+
+
 def retrieve_hybrid(chat: dict,
                     query: str,
                     load_layer: Callable[[str, str], dict],
@@ -2785,6 +2873,8 @@ def retrieve_hybrid(chat: dict,
         kept.append(record)
         tokens_used += block_tokens
 
+    tokens_used, extended = _with_neighbours(kept, token_budget, tokens_used)
+
     return {
         "mode": "hybrid",
         "blocks": [record["block"] for record in kept],
@@ -2806,6 +2896,7 @@ def retrieve_hybrid(chat: dict,
         "notes": {
             "layers": list(by_layer.values()),
             "retrieved_chunks": len(kept),
+            "extended_with_neighbours": extended,
             "estimated_tokens": tokens_used,
             "token_budget": token_budget,
         },
@@ -3054,6 +3145,8 @@ def retrieve_followup(chat: dict,
             by_fingerprint[fingerprint] = item
             tokens_used += block_tokens
 
+    tokens_used, extended = _with_neighbours(kept, token_budget, tokens_used)
+
     return {
         "mode": "followup",
         "blocks": [item["block"] for item in kept],
@@ -3065,6 +3158,7 @@ def retrieve_followup(chat: dict,
             "candidates": sum(note["candidates"] for note in need_notes),
             "selected": len(kept),
             "retrieved_chunks": len(kept),
+            "extended_with_neighbours": extended,
             "estimated_tokens": tokens_used,
             "token_budget": token_budget,
             "selection": {

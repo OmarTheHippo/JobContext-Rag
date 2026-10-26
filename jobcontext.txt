@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, quote
 
 # ===== 1. SETTINGS & PATHS ==========================================================
 
-APP_VERSION = "3.9.1"
+APP_VERSION = "3.10.0"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
@@ -224,6 +224,8 @@ DEFAULT_SETTINGS = {
     # scanned PDF pages and images when indexing; see jobcontext_rag.
     "keyword_search": True,
     "ocr": True,
+    # Join the passages next to the best matches (see jobcontext_rag._with_neighbours).
+    "neighbours": True,
     # Ask the API to stream replies (see _genai_complete); keeps slow requests alive.
     "stream": True,
     # How requests reach the API: "env" (default), "system" or "none"; see _open().
@@ -1092,7 +1094,8 @@ def apply_search_settings(s: dict | None = None) -> None:
     """Point document search at the embedding model and passage size in Settings."""
     s = s or load_settings()
     override = int(s.get("chunk_chars") or 0)
-    options = {"keyword_search": s.get("keyword_search", True), "ocr": s.get("ocr", True)}
+    options = {"keyword_search": s.get("keyword_search", True), "ocr": s.get("ocr", True),
+               "neighbours": s.get("neighbours", True)}
     if s.get("embedding_mode") == "api":
         model = (s.get("embedding_model") or "").strip()
         rag.configure_search(api_embed, f"api:{model or '(not set)'}",
@@ -1208,6 +1211,8 @@ def layer_summary(layer: dict, kind: str) -> dict:
         for key in ("id", "name", "description", "content", "updated")
     }
     out["versions"] = len(layer.get("history", []))
+    if kind == "projects":
+        out["brief_enabled"] = brief_enabled(layer)
     out["repository"] = layer.get(
         "repository",
         _default_repository(kind, layer.get("id", "")),
@@ -1830,8 +1835,16 @@ def _brief_signature(sources: list[dict], guidance: str) -> str:
     return _short_hash("\n".join(parts) + "\n--\n" + guidance)
 
 
+def brief_enabled(layer: dict) -> bool:
+    """Per-project switch for file cards and the brief (on unless turned off)."""
+    return layer.get("brief_enabled", True) is not False
+
+
 def brief_section(layer: dict) -> str:
-    """The brief as it appears in the system prompt and to the planner ('' if none)."""
+    """The brief as it appears in the system prompt and to the planner ('' if none,
+    or if the project's brief is switched off)."""
+    if not brief_enabled(layer):
+        return ""
     brief = layer.get("brief") or {}
     text = (brief.get("text") or "").strip()
     if not text:
@@ -2154,6 +2167,7 @@ def get_settings(body, query):
             "chunk_chars_effective": rag.CHUNK_CHARS,
             "keyword_search": s.get("keyword_search", True),
             "ocr": s.get("ocr", True),
+            "neighbours": s.get("neighbours", True),
             "file_types": rag.file_type_support(),
             "stream": s.get("stream", True),
             "proxy_mode": s.get("proxy_mode", "env"),
@@ -2205,7 +2219,7 @@ def set_settings(body, query):
         s["brief_guidance"] = str(body["brief_guidance"]).strip()
     if "stream" in body:
         s["stream"] = bool(body["stream"])
-    for flag in ("keyword_search", "ocr"):
+    for flag in ("keyword_search", "ocr", "neighbours"):
         if flag in body:
             s[flag] = bool(body[flag])
     if body.get("proxy_mode") in PROXY_MODES:
@@ -2272,6 +2286,9 @@ def update_layer(kind, item_id, body, query):
     for field in ("name", "description"):
         if field in body:
             layer[field] = str(body[field]).strip()
+
+    if kind == "projects" and isinstance(body.get("brief_enabled"), bool):
+        layer["brief_enabled"] = body["brief_enabled"]
 
     layer["updated"] = time.time()
     return layer_summary(save(kind, layer), kind)
@@ -2382,7 +2399,8 @@ def _index_worker(kind: str, item_id: str, path: str, rebuild: bool = False) -> 
                                    repository=result["repository"])
         # Projects get a fresh brief after each index. Unchanged files reuse their
         # cached cards, so only new or changed files cost API calls.
-        if kind == "projects" and result["repository"]["file_count"]:
+        if (kind == "projects" and result["repository"]["file_count"]
+                and brief_enabled(load(kind, item_id))):
             start_brief_job(item_id)
     except Exception as exc:
         if not isinstance(exc, (ValueError, RuntimeError, LLMError)):
@@ -3406,6 +3424,8 @@ PAGE_HTML = r"""<!doctype html>
       project numbers, form or drawing numbers and acronyms (no re-index needed)</label>
     <label><input id="set-ocr" type="checkbox"> Read scanned PDF pages and images with OCR
       when indexing</label>
+    <label><input id="set-neighbours" type="checkbox"> Include neighbouring text: the best
+      matches also get the passage before and after them, when it fits</label>
     <div class="small muted" id="set-file-types"></div>
     <div class="small muted">Changing the embedding model or passage size requires
       re-indexing each folder; the editor flags folders indexed with other settings.</div>
@@ -3610,6 +3630,7 @@ async function openSettings() {
   $("#set-chunk").value = s.chunk_chars || "";
   $("#set-keyword").checked = s.keyword_search !== false;
   $("#set-ocr").checked = s.ocr !== false;
+  $("#set-neighbours").checked = s.neighbours !== false;
   $("#set-file-types").innerHTML = fileTypesHtml(s.file_types || []);
   $("#set-embed-endpoint").textContent = s.embeddings_endpoint
     ? `Embedding requests go to: ${s.embeddings_endpoint}` : "";
@@ -3663,6 +3684,7 @@ async function saveSettings(extra = {}) {
     embedding_mode: $("#set-embed-mode").value, embedding_model: $("#set-embed-model").value,
     chunk_chars: $("#set-chunk").value,
     keyword_search: $("#set-keyword").checked, ocr: $("#set-ocr").checked,
+    neighbours: $("#set-neighbours").checked,
     stream: $("#set-stream").checked, proxy_mode: $("#set-proxy").value,
     api_client: $("#set-client").value, message_format: $("#set-format").value,
     limit_param: $("#set-limit-param").value,
@@ -4848,6 +4870,12 @@ function renderLibEdit() {
     ${kind === "projects" ? `
     <section class="repo" id="brief-section">
       <h3>Project brief</h3>
+      <label><input id="brief-enabled" type="checkbox" ${layer.brief_enabled !== false ? "checked" : ""}>
+        Make file cards and a project brief for this project</label>
+      <p class="muted small">Off: indexing makes no cards or brief (no API calls for them),
+        and no brief is sent with chats or to the planner. Cards already made are kept,
+        so turning it back on only redoes new or changed files.</p>
+      <div id="brief-parts" ${layer.brief_enabled === false ? "hidden" : ""}>
       <p class="muted small">
         Auto-generated from this project's indexed files: one summary card per file,
         then one combined brief. It is sent with chats that use this project and guides
@@ -4860,10 +4888,27 @@ function renderLibEdit() {
         <button id="brief-generate" class="primary">Generate brief</button>
       </div>
       <div id="brief-body"></div>
+      </div>
     </section>` : ""}
   `;
 
   if (kind === "projects") {
+    $("#brief-enabled").onchange = async (event) => {
+      const enabled = event.target.checked;
+      try {
+        const saved = await api(`/api/projects/${layer.id}`, {
+          method: "PUT", json: { brief_enabled: enabled } });
+        const index = state.projects.findIndex((item) => item.id === layer.id);
+        if (index >= 0) state.projects[index] = saved;
+        layer.brief_enabled = enabled;
+        $("#brief-parts").hidden = !enabled;
+        if (enabled) loadBrief(layer.id);
+        toast(enabled ? "Project brief on" : "Project brief off");
+      } catch (error) {
+        event.target.checked = !enabled;
+        toast(error.message);
+      }
+    };
     $("#brief-generate").onclick = async () => {
       try {
         await api(`/api/projects/${layer.id}/brief`, { json: {} });
